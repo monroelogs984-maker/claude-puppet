@@ -39,6 +39,8 @@ public class ClaudePuppet {
         NeoForge.EVENT_BUS.addListener(bridge::onPlayerHurt);
         NeoForge.EVENT_BUS.addListener(bridge::onChangedDimension);
         NeoForge.EVENT_BUS.addListener(bridge::onAdvancement);
+        NeoForge.EVENT_BUS.addListener(bridge::onBlockBreak);
+        NeoForge.EVENT_BUS.addListener(bridge::onBlockPlace);
         NeoForge.EVENT_BUS.addListener(bridge::onServerStopping);
 
         if (FMLEnvironment.dist.isClient()) {

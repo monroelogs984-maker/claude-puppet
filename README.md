@@ -45,6 +45,16 @@ puppet's view every 1.5 seconds and stitches them into a single grid image, `cla
 row, left to right then top to bottom). Claude gets the whole sequence in one look: about 13 frames for 20 seconds.
 Each frame is a one or two frame camera switch on your client, so expect a light flicker while it runs.
 
+## Monitoring (recap)
+
+`/claudemonitor [seconds] [text|view]` (default 30 seconds, text) records what happens around you and hands Claude one
+compact report at the end, `claudepuppet/monitor.txt`: chat from the minute before, a timeline sampled every 3 seconds
+(position, health, food, held item, what you're looking at, mobs arriving and leaving within 24 blocks, the nearest
+hostile) with damage, kills, deaths, chat, dimension changes and advancements as they happen, and totals (damage, kills,
+blocks broken and placed). `view` adds `monitor_view.png`: frames from your own camera every 3 seconds (no camera switch,
+only the HUD blinks). It works without the puppet, and it's a single wake-up for Claude, so the cost is about one reply
+(text) or one `watch` (view).
+
 ## The puppet
 
 A pathfinding mob with the player model and a robot skin (`make_skin.py` generates it). 150 health, regenerates out

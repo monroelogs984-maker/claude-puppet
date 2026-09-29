@@ -171,6 +171,11 @@ public class PuppetBridge {
     /** How much Claude listens: off, low (default), normal or high. Read by Claude's watcher from effort.txt. **/
     private String effort = "low";
     private static final List<String> EFFORT_LEVELS = List.of("off", "low", "normal", "high");
+    /** The running /claudemonitor recap, if any. **/
+    private PuppetMonitor monitor;
+    /** Chat from the last minute (game time, line), kept so a monitor report can include what was said just before. **/
+    private final java.util.ArrayDeque<Map.Entry<Long, String>> recentChat = new java.util.ArrayDeque<>();
+
     /** True while fighting back on its own; when that fight ends it quietly resumes following. **/
     private boolean selfDefense = false;
 
@@ -179,6 +184,14 @@ public class PuppetBridge {
     //                  /claudepuppet
     // ==================================================
     public void onRegisterCommands(RegisterCommandsEvent event) {
+        java.util.function.Predicate<CommandSourceStack> allowed = source -> source.isPlayer() && (source.getServer().isSingleplayerOwner(source.getPlayer().getGameProfile()) || source.hasPermission(2));
+        event.getDispatcher().register(Commands.literal("claudemonitor")
+                .requires(allowed)
+                .executes(context -> this.startMonitor(context.getSource().getPlayer(), 30, false))
+                .then(Commands.argument("seconds", com.mojang.brigadier.arguments.IntegerArgumentType.integer(5, 120))
+                        .executes(context -> this.startMonitor(context.getSource().getPlayer(), com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "seconds"), false))
+                        .then(Commands.literal("text").executes(context -> this.startMonitor(context.getSource().getPlayer(), com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "seconds"), false)))
+                        .then(Commands.literal("view").executes(context -> this.startMonitor(context.getSource().getPlayer(), com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "seconds"), true)))));
         event.getDispatcher().register(Commands.literal("claudepuppet")
                 .requires(source -> source.isPlayer() && (source.getServer().isSingleplayerOwner(source.getPlayer().getGameProfile()) || source.hasPermission(2)))
                 .executes(context -> this.activate(context.getSource().getPlayer()))
@@ -258,6 +271,68 @@ public class PuppetBridge {
         return Command.SINGLE_SUCCESS;
     }
 
+    /**
+     * /claudemonitor: records what happens around the player for a while and hands Claude one compact report at the end
+     * (claudepuppet/monitor.txt, plus monitor_view.png with "view": frames from the player's own camera every 3s).
+     * Works without the puppet; it only sets up the bridge folder if Claude isn't tuned in yet.
+     */
+    private int startMonitor(ServerPlayer player, int seconds, boolean view) {
+        if (this.monitor != null) {
+            player.sendSystemMessage(Component.literal("Claude is already monitoring.").withStyle(ChatFormatting.GRAY));
+            return 0;
+        }
+        if (!this.active || this.dir == null) {
+            if (!this.setupBridge(player)) {
+                return 0;
+            }
+        }
+        this.ownerId = player.getUUID();
+        PuppetMonitor session = new PuppetMonitor(seconds, view, player.level().getGameTime());
+        this.monitor = session;
+        if (view) {
+            int frames = Math.max(1, seconds / 3);
+            FLIPBOOK.request(player.getId(), this.dir.resolve("monitor_view.png"), frames, WATCH_FRAME_WIDTH, 3000L, result -> {
+                session.viewResult = result;
+                session.viewDone = true;
+            });
+        }
+        player.sendSystemMessage(Component.literal("[Claude] Watching what happens for " + seconds + "s" + (view ? ", with your view" : "") + "...").withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC));
+        return Command.SINGLE_SUCCESS;
+    }
+
+    private void tickMonitor() {
+        if (this.monitor == null) {
+            return;
+        }
+        ServerPlayer owner = this.getOwner();
+        boolean timeUp = this.monitor.tick(owner);
+        if (!timeUp || !this.monitor.viewDone) {
+            return;
+        }
+        long now = this.server.overworld().getGameTime();
+        List<String> chatBefore = new java.util.ArrayList<>();
+        long start = now - this.monitor.durationTicks;
+        for (Map.Entry<Long, String> chat : this.recentChat) {
+            if (chat.getKey() < start) {
+                chatBefore.add(chat.getValue());
+            }
+        }
+        String viewNote = null;
+        if (this.monitor.view) {
+            viewNote = this.monitor.viewResult != null && this.monitor.viewResult.startsWith("SNAPSHOT") ? this.monitor.viewResult.substring(9) : String.valueOf(this.monitor.viewResult);
+        }
+        String report = this.monitor.report(owner != null ? owner.getName().getString() : "?", this.monitor.durationTicks / 20, chatBefore, viewNote);
+        this.monitor = null;
+        Path path = this.dir.resolve("monitor.txt");
+        try {
+            Files.writeString(path, report, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            this.event("ERROR writing monitor report: " + e);
+            return;
+        }
+        this.event("MONITOR " + path + (viewNote != null ? " + monitor_view.png" : ""));
+    }
+
     private void writeEffort() {
         if (this.dir == null) {
             return;
@@ -270,6 +345,14 @@ public class PuppetBridge {
     }
 
     private int activate(ServerPlayer player) {
+        if (!this.setupBridge(player)) {
+            return 0;
+        }
+        return this.finishActivate(player);
+    }
+
+    /** Points the bridge at this world's folder and owner (no puppet). **/
+    private boolean setupBridge(ServerPlayer player) {
         this.server = player.getServer();
         this.ownerId = player.getUUID();
         this.dir = this.server.getServerDirectory().resolve("claudepuppet");
@@ -290,9 +373,13 @@ public class PuppetBridge {
             this.writeEffort();
         } catch (IOException e) {
             player.sendSystemMessage(Component.literal("Claude Puppet couldn't create " + this.dir + ": " + e).withStyle(ChatFormatting.RED));
-            return 0;
+            return false;
         }
+        this.active = true;
+        return true;
+    }
 
+    private int finishActivate(ServerPlayer player) {
         // Find an existing puppet near the player, or spawn one.
         PuppetEntity puppet = this.getPuppet();
         if (puppet == null) {
@@ -360,6 +447,14 @@ public class PuppetBridge {
     //                 Chat and Events
     // ==================================================
     public void onChat(ServerChatEvent event) {
+        long now = event.getPlayer().level().getGameTime();
+        this.recentChat.addLast(Map.entry(now, "<" + event.getPlayer().getName().getString() + "> " + event.getRawText()));
+        while (!this.recentChat.isEmpty() && now - this.recentChat.peekFirst().getKey() > 20 * 60 + (this.monitor != null ? this.monitor.durationTicks : 0)) {
+            this.recentChat.pollFirst();
+        }
+        if (this.monitor != null) {
+            this.monitor.note("chat <" + event.getPlayer().getName().getString() + "> " + event.getRawText());
+        }
         if (this.active) {
             this.event("CHAT <" + event.getPlayer().getName().getString() + "> " + event.getRawText());
         }
@@ -368,6 +463,10 @@ public class PuppetBridge {
     /** A player or the puppet took damage (at most one event each per 5 seconds, so a fight doesn't flood the log). **/
     public void onPlayerHurt(LivingDamageEvent.Post event) {
         LivingEntity entity = event.getEntity();
+        if (this.monitor != null && entity.getUUID().equals(this.ownerId) && event.getNewDamage() > 0) {
+            Entity source = event.getSource().getEntity();
+            this.monitor.onDamage(event.getNewDamage(), event.getSource().getMsgId() + (source != null ? " (" + BuiltInRegistries.ENTITY_TYPE.getKey(source.getType()).getPath() + ")" : ""));
+        }
         if (!this.active || !(entity instanceof ServerPlayer || entity instanceof PuppetEntity) || event.getNewDamage() <= 0) {
             return;
         }
@@ -392,19 +491,45 @@ public class PuppetBridge {
                 + (attacker != null ? " (" + BuiltInRegistries.ENTITY_TYPE.getKey(attacker.getType()) + ")" : "") + ", health now " + Math.round(entity.getHealth() * 10) / 10.0);
     }
 
+    public void onBlockBreak(net.neoforged.neoforge.event.level.BlockEvent.BreakEvent event) {
+        if (this.monitor != null && event.getPlayer().getUUID().equals(this.ownerId)) {
+            this.monitor.onBreak(BuiltInRegistries.BLOCK.getKey(event.getState().getBlock()).getPath());
+        }
+    }
+
+    public void onBlockPlace(net.neoforged.neoforge.event.level.BlockEvent.EntityPlaceEvent event) {
+        if (this.monitor != null && event.getEntity() != null && event.getEntity().getUUID().equals(this.ownerId)) {
+            this.monitor.onPlace(BuiltInRegistries.BLOCK.getKey(event.getPlacedBlock().getBlock()).getPath());
+        }
+    }
+
     public void onChangedDimension(PlayerEvent.PlayerChangedDimensionEvent event) {
+        if (this.monitor != null && event.getEntity().getUUID().equals(this.ownerId)) {
+            this.monitor.note("went to " + event.getTo().location().getPath());
+        }
         if (this.active) {
             this.event("DIMENSION " + event.getEntity().getName().getString() + " -> " + event.getTo().location());
         }
     }
 
     public void onAdvancement(AdvancementEvent.AdvancementEarnEvent event) {
+        if (this.monitor != null && event.getAdvancement().value().display().isPresent()) {
+            this.monitor.note("advancement: " + event.getAdvancement().value().display().get().getTitle().getString());
+        }
         if (this.active && event.getAdvancement().value().display().isPresent()) {
             this.event("ADVANCEMENT " + event.getEntity().getName().getString() + ": " + event.getAdvancement().value().display().get().getTitle().getString());
         }
     }
 
     public void onLivingDeath(LivingDeathEvent event) {
+        if (this.monitor != null) {
+            Entity killer = event.getSource().getEntity();
+            if (killer != null && killer.getUUID().equals(this.ownerId)) {
+                this.monitor.onKill(event.getEntity());
+            } else if (event.getEntity().getUUID().equals(this.ownerId)) {
+                this.monitor.note("DIED: " + event.getSource().getLocalizedDeathMessage(event.getEntity()).getString());
+            }
+        }
         if (!this.active) {
             return;
         }
@@ -482,6 +607,12 @@ public class PuppetBridge {
 
         if (this.ticks % 5 == 0) {
             this.readCommands();
+        }
+        try {
+            this.tickMonitor();
+        } catch (Exception e) {
+            this.event("ERROR monitor stopped: " + e);
+            this.monitor = null;
         }
         if (this.ticks % 100 == 0 && this.respawnTimer <= 0) {
             this.removeStrayPuppets(null);
