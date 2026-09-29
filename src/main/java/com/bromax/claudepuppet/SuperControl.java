@@ -86,7 +86,26 @@ public class SuperControl {
         body.setHealth(body.getMaxHealth());
         // Tell the (local) clients this player exists, unlisted (so it isn't in the tab list), then add it to the world.
         server.getPlayerList().broadcastAll(new ClientboundPlayerInfoUpdatePacket(EnumSet.of(ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER), List.of(body)));
-        level.addNewPlayer(body);
+        try {
+            level.addNewPlayer(body);
+        } catch (Exception e) {
+            // Another mod's "player joined" hook couldn't cope with a connection-less player: back out cleanly.
+            server.getPlayerList().broadcastAll(new ClientboundPlayerInfoRemovePacket(List.of(SuperPuppet.PROFILE.getId())));
+            if (!body.isRemoved()) {
+                level.removePlayerImmediately(body, Entity.RemovalReason.DISCARDED);
+            }
+            StackTraceElement culprit = null;
+            for (StackTraceElement element : e.getStackTrace()) {
+                if (!element.getClassName().startsWith("net.minecraft") && !element.getClassName().startsWith("net.neoforged")
+                        && !element.getClassName().startsWith("java.") && !element.getClassName().startsWith("com.bromax")) {
+                    culprit = element;
+                    break;
+                }
+            }
+            e.printStackTrace();
+            return "FAIL super: a mod crashed on the fake player joining (" + e.getClass().getSimpleName()
+                    + (culprit != null ? " in " + culprit.getClassName() + "." + culprit.getMethodName() : "") + ")";
+        }
         this.body = body;
         this.wanted = true;
         this.respawnTimer = -1;

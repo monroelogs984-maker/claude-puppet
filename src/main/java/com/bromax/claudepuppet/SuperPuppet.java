@@ -18,7 +18,8 @@ import java.util.function.BiConsumer;
  * gets no-op advancements. It is added to the world only (not the server's player list or tab list), is ticked by
  * {@link PuppetBridge}, and only exists in singleplayer worlds that aren't open to LAN.
  *
- * Differences from a plain FakePlayer: it can be hurt and die (FakePlayer is invulnerable and immortal), and after
+ * Differences from a plain FakePlayer: its connection is a {@link SuperNetHandler} (answers channel queries, applies
+ * teleports), it can be hurt and die (FakePlayer is invulnerable and immortal), and after
  * construction {@link #isFakePlayer()} is false so other mods treat it as an ordinary player.
  */
 public class SuperPuppet extends FakePlayer {
@@ -29,6 +30,7 @@ public class SuperPuppet extends FakePlayer {
 
     public SuperPuppet(ServerLevel level, BiConsumer<SuperPuppet, DamageSource> onDeath) {
         super(level, PROFILE);
+        this.connection = new SuperNetHandler(level.getServer(), this); // Answers "no channels" instead of crashing.
         this.onDeath = onDeath;
         this.constructed = true;
     }
