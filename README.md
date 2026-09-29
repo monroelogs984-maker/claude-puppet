@@ -79,6 +79,21 @@ one wake-up for Claude, so a 10-step possession costs about ten short replies.
 `/claudepuppet tank [on|off]`: 1000 max health, endless Regeneration V, and no single hit deals more than 10 damage
 (damage that bypasses invulnerability, like `/kill` or the void, isn't capped). Stays on through death and respawn.
 
+## Super puppet (a real player body)
+
+`/claudepuppet super [on|off]` spawns "Claude_Puppet", a real server-side player built on NeoForge's `FakePlayer`, for
+testing what mods only do for players: mobs target it, player-proximity spawns count it, and its attacks, item uses and
+block breaks go through the normal player code paths and hooks. It follows the owner by default. Claude drives it with
+`super walkto|follow|attack|stop|tp|here|look|lookat|use|release|useon|break|place|give|select|drop|jump`.
+
+- **Local only.** Singleplayer worlds that aren't open to LAN. It has no network connection (FakePlayer's discards
+  everything) and isn't in the server player list or tab list; the only packet is an unlisted "player exists" notice to
+  your own client so it can be drawn (with the robot skin).
+- It can be hurt and die (drops its inventory, respawns next to you after 10 seconds), sleeps when you sleep so it never
+  blocks skipping the night, and isn't saved: it's removed when the world closes and re-summoned with the command.
+- If any mod errors while ticking it, the super puppet is removed and the error is logged instead of crashing the world.
+- Moves by steering (face the target, walk, sprint, jump), without mob pathfinding.
+
 ## The puppet
 
 A pathfinding mob with the player model and a robot skin (`make_skin.py` generates it). 150 health, regenerates out

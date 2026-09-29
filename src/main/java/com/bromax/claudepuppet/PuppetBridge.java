@@ -177,6 +177,9 @@ public class PuppetBridge {
     /** How much Claude listens: off, low (default), normal or high. Read by Claude's watcher from effort.txt. **/
     private String effort = "low";
     private static final List<String> EFFORT_LEVELS = List.of("off", "low", "normal", "high");
+    /** The super puppet (a real player body, singleplayer only). **/
+    private final SuperControl superControl = new SuperControl(this, this::event);
+
     /** Undo history for Claude's block changes, and the world's named marks. **/
     private final PuppetWorldTools tools = new PuppetWorldTools();
 
@@ -242,6 +245,10 @@ public class PuppetBridge {
                         .then(Commands.literal("full").executes(context -> this.snapshot(0, true)))
                         .then(Commands.argument("width", com.mojang.brigadier.arguments.IntegerArgumentType.integer(32, 4096))
                                 .executes(context -> this.snapshot(com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "width"), true))))
+                .then(Commands.literal("super")
+                        .executes(context -> this.superCommand(context.getSource(), true))
+                        .then(Commands.literal("on").executes(context -> this.superCommand(context.getSource(), true)))
+                        .then(Commands.literal("off").executes(context -> this.superCommand(context.getSource(), false))))
                 .then(Commands.literal("possess")
                         .executes(context -> this.startPossession(10))
                         .then(Commands.argument("steps", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 30))
@@ -556,6 +563,31 @@ public class PuppetBridge {
         this.place(puppet, pos, blockId);
     }
 
+    private int superCommand(CommandSourceStack source, boolean on) {
+        ServerPlayer player = source.getPlayer();
+        if (!this.active || this.dir == null) {
+            if (!this.setupBridge(player)) {
+                return 0;
+            }
+        }
+        String result;
+        if (on) {
+            result = this.superControl.spawn(player);
+        } else {
+            this.superControl.dismiss(source.getServer());
+            result = "OK super dismissed";
+        }
+        this.event(result);
+        source.sendSystemMessage(Component.literal(result.startsWith("FAIL") ? result.substring(5) : on ? "Claude's super puppet is here (a real player body; /claudepuppet super off to remove)." : "Super puppet removed.").withStyle(ChatFormatting.GRAY));
+        return result.startsWith("FAIL") ? 0 : Command.SINGLE_SUCCESS;
+    }
+
+    public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+        if (event.getEntity() instanceof ServerPlayer player) {
+            this.superControl.onPlayerJoin(player);
+        }
+    }
+
     private void writeEffort() {
         if (this.dir == null) {
             return;
@@ -638,6 +670,9 @@ public class PuppetBridge {
     }
 
     private int deactivate(ServerPlayer player, boolean removePuppet) {
+        if (removePuppet) {
+            this.superControl.dismiss(this.server);
+        }
         PuppetEntity puppet = this.getPuppet();
         if (removePuppet && puppet != null) {
             puppet.discard();
@@ -652,6 +687,7 @@ public class PuppetBridge {
     }
 
     public void onServerStopping(ServerStoppingEvent event) {
+        this.superControl.remove(event.getServer(), false); // Not saved: it's re-summoned with /claudepuppet super.
         if (this.active) {
             this.deactivate(null, false);
         }
@@ -835,6 +871,13 @@ public class PuppetBridge {
 
         if (this.ticks % 5 == 0) {
             this.readCommands();
+        }
+        try {
+            this.superControl.tick(this.server, this.getOwner());
+        } catch (Exception e) {
+            this.event("ERROR super puppet removed: " + e);
+            e.printStackTrace();
+            this.superControl.dismiss(this.server);
         }
         try {
             this.tickMonitor();
@@ -1112,6 +1155,10 @@ public class PuppetBridge {
                     this.requirePuppet(puppet);
                     ItemStack stack = this.itemStack(args[0]);
                     puppet.setItemSlot(puppet.getEquipmentSlotForItem(stack), stack);
+                }
+                case "super" -> {
+                    this.event(this.superControl.command(this.server, owner, args, this::targetFrom));
+                    return;
                 }
                 case "possess" -> {
                     this.startPossession(args.length > 0 ? Math.max(1, Math.min(30, Integer.parseInt(args[0]))) : 10);
@@ -1868,6 +1915,10 @@ public class PuppetBridge {
             }
             status.append(" | near:");
             nearbyCounts.forEach((type, count) -> status.append(" ").append(type).append(count > 1 ? "x" + count : ""));
+        }
+        String superStatus = this.superControl.status();
+        if (superStatus != null) {
+            status.append(" | ").append(superStatus);
         }
         if (!this.tools.getMarks().isEmpty()) {
             status.append(" | marks:");

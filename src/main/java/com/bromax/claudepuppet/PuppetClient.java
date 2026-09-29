@@ -48,7 +48,36 @@ public class PuppetClient {
     private static final java.util.List<NativeImage> sequenceFrames = new java.util.ArrayList<>();
     private static boolean captureForSequence = false;
 
+    // Super puppet skin: a PlayerRenderer with the robot texture, drawn in place of the normal one for its UUID.
+    private static net.minecraft.client.renderer.entity.player.PlayerRenderer superRenderer;
+    private static boolean renderingSuper = false;
+
+    public static void captureContext(EntityRenderersEvent.AddLayers event) {
+        superRenderer = new net.minecraft.client.renderer.entity.player.PlayerRenderer(event.getContext(), false) {
+            @Override
+            public ResourceLocation getTextureLocation(net.minecraft.client.player.AbstractClientPlayer player) {
+                return SKIN;
+            }
+        };
+    }
+
+    private static void onRenderPlayer(net.neoforged.neoforge.client.event.RenderPlayerEvent.Pre event) {
+        if (renderingSuper || superRenderer == null || !event.getEntity().getUUID().equals(SuperPuppet.PROFILE.getId())) {
+            return;
+        }
+        event.setCanceled(true);
+        renderingSuper = true;
+        try {
+            var player = (net.minecraft.client.player.AbstractClientPlayer) event.getEntity();
+            float yaw = net.minecraft.util.Mth.lerp(event.getPartialTick(), player.yRotO, player.getYRot());
+            superRenderer.render(player, yaw, event.getPartialTick(), event.getPoseStack(), event.getMultiBufferSource(), event.getPackedLight());
+        } finally {
+            renderingSuper = false;
+        }
+    }
+
     public static void init() {
+        NeoForge.EVENT_BUS.addListener(PuppetClient::onRenderPlayer);
         PuppetBridge.SNAPSHOT = PuppetClient::requestSnapshot;
         PuppetBridge.FLIPBOOK = PuppetClient::requestFlipbook;
         NeoForge.EVENT_BUS.addListener(PuppetClient::onRenderFramePre);

@@ -43,9 +43,11 @@ public class ClaudePuppet {
         NeoForge.EVENT_BUS.addListener(bridge::onBlockBreak);
         NeoForge.EVENT_BUS.addListener(bridge::onBlockPlace);
         NeoForge.EVENT_BUS.addListener(bridge::onServerStopping);
+        NeoForge.EVENT_BUS.addListener(bridge::onPlayerLoggedIn);
 
         if (FMLEnvironment.dist.isClient()) {
             modEventBus.addListener(PuppetClient::registerRenderers);
+            modEventBus.addListener(PuppetClient::captureContext);
             PuppetClient.init();
         }
     }
