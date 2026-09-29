@@ -33,6 +33,15 @@ public class PuppetEntity extends PathfinderMob implements InventoryCarrier {
     public static final int INVENTORY_SIZE = 36;
     private final SimpleContainer inventory = new SimpleContainer(INVENTORY_SIZE);
 
+    /** Tank mode: 1000 health, endless Regeneration V, and no hit deals more than 10 (except /kill-type damage). **/
+    public static final double TANK_HEALTH = 1000.0D;
+    public static final float TANK_DAMAGE_CAP = 10.0F;
+    public static final double NORMAL_HEALTH = 150.0D;
+    private boolean tank = false;
+
+    /** While Claude possesses it: its own look-around AI is off and Claude's inputs drive it. **/
+    private boolean possessed = false;
+
     public PuppetEntity(EntityType<? extends PathfinderMob> type, Level level) {
         super(type, level);
         this.setPersistenceRequired();
@@ -56,8 +65,28 @@ public class PuppetEntity extends PathfinderMob implements InventoryCarrier {
     @Override
     protected void registerGoals() {
         this.goalSelector.addGoal(0, new FloatGoal(this));
-        this.goalSelector.addGoal(8, new LookAtPlayerGoal(this, Player.class, 8.0F));
-        this.goalSelector.addGoal(9, new RandomLookAroundGoal(this));
+        this.goalSelector.addGoal(8, new LookAtPlayerGoal(this, Player.class, 8.0F) {
+            @Override
+            public boolean canUse() {
+                return !PuppetEntity.this.possessed && super.canUse();
+            }
+
+            @Override
+            public boolean canContinueToUse() {
+                return !PuppetEntity.this.possessed && super.canContinueToUse();
+            }
+        });
+        this.goalSelector.addGoal(9, new RandomLookAroundGoal(this) {
+            @Override
+            public boolean canUse() {
+                return !PuppetEntity.this.possessed && super.canUse();
+            }
+
+            @Override
+            public boolean canContinueToUse() {
+                return !PuppetEntity.this.possessed && super.canContinueToUse();
+            }
+        });
     }
 
     @Override
@@ -67,6 +96,31 @@ public class PuppetEntity extends PathfinderMob implements InventoryCarrier {
         if (!this.level().isClientSide && this.isAlive() && this.tickCount % 40 == 0 && this.getHealth() < this.getMaxHealth()
                 && this.tickCount - this.getLastHurtByMobTimestamp() > 200 && this.hurtTime == 0) {
             this.heal(2.0F);
+        }
+    }
+
+    public boolean isPossessed() {
+        return this.possessed;
+    }
+
+    public void setPossessed(boolean possessed) {
+        this.possessed = possessed;
+    }
+
+    public boolean isTank() {
+        return this.tank;
+    }
+
+    public void setTank(boolean tank) {
+        this.tank = tank;
+        this.getAttribute(Attributes.MAX_HEALTH).setBaseValue(tank ? TANK_HEALTH : NORMAL_HEALTH);
+        if (tank) {
+            this.addEffect(new net.minecraft.world.effect.MobEffectInstance(net.minecraft.world.effect.MobEffects.REGENERATION,
+                    net.minecraft.world.effect.MobEffectInstance.INFINITE_DURATION, 4, false, false, true));
+            this.setHealth(this.getMaxHealth());
+        } else {
+            this.removeEffect(net.minecraft.world.effect.MobEffects.REGENERATION);
+            this.setHealth(Math.min(this.getHealth(), this.getMaxHealth()));
         }
     }
 
@@ -125,12 +179,14 @@ public class PuppetEntity extends PathfinderMob implements InventoryCarrier {
         super.addAdditionalSaveData(tag);
         this.writeInventoryToTag(tag, this.registryAccess());
         tag.putInt("PuppetVersion", PUPPET_VERSION);
+        tag.putBoolean("PuppetTank", this.tank);
     }
 
     @Override
     public void readAdditionalSaveData(CompoundTag tag) {
         super.readAdditionalSaveData(tag);
         this.readInventoryFromTag(tag, this.registryAccess());
+        this.tank = tag.getBoolean("PuppetTank");
         if (tag.getInt("PuppetVersion") < 2) {
             // v1 puppets: 20 health, 4 base damage, invulnerable.
             this.getAttribute(Attributes.MAX_HEALTH).setBaseValue(150.0D);

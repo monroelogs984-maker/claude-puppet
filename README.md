@@ -65,6 +65,20 @@ only the HUD blinks). It works without the puppet, and it's a single wake-up for
   Marks are saved with the world (`claudepuppet_marks.json` in the world folder). The puppet takes them anywhere it takes
   coordinates (`walkto home`, `tp arena`), Claude can set them (`mark <name> [x y z]`), and they're in `status.txt`.
 
+## Possession
+
+`/claudepuppet possess [steps]` (default 10, max 30) hands Claude direct control: the puppet's own look-around AI and
+self-defence switch off, and Claude drives it one step at a time with inputs like `forward 4; turn 90; jump`, `left 2`,
+`look 30`, `hit` (attack or mine what's in the crosshair), `use`, `place <block>`, `sprint on`, `sneak on`, `wait 20`.
+After each step Claude gets a first-person snapshot and a one-line report (crosshair target, position, health, nearby
+hostiles). It ends when the steps run out, on `/claudepuppet release`, or after 60 seconds without input. Each step is
+one wake-up for Claude, so a 10-step possession costs about ten short replies.
+
+## Tank mode
+
+`/claudepuppet tank [on|off]`: 1000 max health, endless Regeneration V, and no single hit deals more than 10 damage
+(damage that bypasses invulnerability, like `/kill` or the void, isn't capped). Stays on through death and respawn.
+
 ## The puppet
 
 A pathfinding mob with the player model and a robot skin (`make_skin.py` generates it). 150 health, regenerates out

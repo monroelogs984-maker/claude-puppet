@@ -146,7 +146,13 @@ public class PuppetBridge {
     private int respawnTimer = -1;
 
     // Puppet orders:
-    private enum Mode { IDLE, WALK, FOLLOW, ATTACK, GUARD, BREAK, GATHER }
+    private enum Mode { IDLE, WALK, FOLLOW, ATTACK, GUARD, BREAK, GATHER, POSSESS }
+
+    /** Claude driving the puppet directly (null when not possessed). **/
+    private PuppetPossession possession;
+    private final List<String> stepNotes = new java.util.ArrayList<>();
+    /** Tank mode survives the puppet's death: the respawned body gets it back. **/
+    private boolean tankWanted = false;
     private Mode mode = Mode.IDLE;
     private Vec3 walkTarget;
     private double walkSpeed = 1.0D;
@@ -236,6 +242,18 @@ public class PuppetBridge {
                         .then(Commands.literal("full").executes(context -> this.snapshot(0, true)))
                         .then(Commands.argument("width", com.mojang.brigadier.arguments.IntegerArgumentType.integer(32, 4096))
                                 .executes(context -> this.snapshot(com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "width"), true))))
+                .then(Commands.literal("possess")
+                        .executes(context -> this.startPossession(10))
+                        .then(Commands.argument("steps", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 30))
+                                .executes(context -> this.startPossession(com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "steps")))))
+                .then(Commands.literal("release").executes(context -> {
+                    this.releasePossession("released by " + context.getSource().getTextName());
+                    return Command.SINGLE_SUCCESS;
+                }))
+                .then(Commands.literal("tank")
+                        .executes(context -> this.setTank(context.getSource(), !this.tankWanted))
+                        .then(Commands.literal("on").executes(context -> this.setTank(context.getSource(), true)))
+                        .then(Commands.literal("off").executes(context -> this.setTank(context.getSource(), false))))
                 .then(Commands.literal("watch")
                         .executes(context -> this.watch(20, true))
                         .then(Commands.argument("seconds", com.mojang.brigadier.arguments.IntegerArgumentType.integer(2, 60))
@@ -408,6 +426,136 @@ public class PuppetBridge {
         return new Vec3(Double.parseDouble(args[index]), Double.parseDouble(args[index + 1]), Double.parseDouble(args[index + 2]));
     }
 
+    private int setTank(CommandSourceStack source, boolean on) {
+        PuppetEntity puppet = this.getPuppet();
+        if (puppet == null) {
+            if (source != null) {
+                source.sendSystemMessage(Component.literal("No puppet right now.").withStyle(ChatFormatting.GRAY));
+            }
+            return 0;
+        }
+        this.tankWanted = on;
+        puppet.setTank(on);
+        String message = on ? "Tank mode ON: 1000 HP, endless Regeneration V, no hit deals more than 10." : "Tank mode off: back to 150 HP.";
+        this.announce(message);
+        this.event("TANK " + (on ? "on" : "off"));
+        return Command.SINGLE_SUCCESS;
+    }
+
+    /** Called by the damage event: tank mode caps each hit at 10 (sources that bypass invulnerability, like /kill, aren't capped). **/
+    public void onDamagePre(LivingDamageEvent.Pre event) {
+        if (event.getEntity() instanceof PuppetEntity puppet && puppet.isTank()
+                && !event.getSource().is(net.minecraft.tags.DamageTypeTags.BYPASSES_INVULNERABILITY)
+                && event.getNewDamage() > PuppetEntity.TANK_DAMAGE_CAP) {
+            event.setNewDamage(PuppetEntity.TANK_DAMAGE_CAP);
+        }
+    }
+
+    // ==================================================
+    //                   Possession
+    // ==================================================
+    private int startPossession(int steps) {
+        PuppetEntity puppet = this.getPuppet();
+        if (!this.active || puppet == null) {
+            this.event("FAIL possess: no puppet");
+            return 0;
+        }
+        this.setIdle();
+        this.possession = new PuppetPossession(steps, puppet);
+        this.possession.start(puppet);
+        this.mode = Mode.POSSESS;
+        this.stepNotes.clear();
+        this.announce("Claude has taken control (" + steps + " steps).");
+        this.reportStep(puppet); // Step 0: the starting view.
+        return Command.SINGLE_SUCCESS;
+    }
+
+    private void releasePossession(String reason) {
+        if (this.possession == null) {
+            return;
+        }
+        PuppetEntity puppet = this.getPuppet();
+        if (puppet != null) {
+            this.possession.end(puppet);
+        }
+        this.possession = null;
+        this.event("POSSESS ended: " + reason);
+        this.announce("Claude released control.");
+        this.followOwner();
+    }
+
+    /** Snapshot + one-line report after each step (wakes Claude). **/
+    private void reportStep(PuppetEntity puppet) {
+        PuppetPossession session = this.possession;
+        session.awaitingSnapshot = true;
+        String crosshair = session.describeCrosshair(puppet);
+        List<String> hostiles = new java.util.ArrayList<>();
+        for (Entity entity : puppet.level().getEntities(puppet, puppet.getBoundingBox().inflate(16), entity -> entity instanceof Enemy && entity.isAlive())) {
+            hostiles.add(BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath() + " " + Math.round(entity.distanceTo(puppet)) + "m");
+        }
+        String line = "STEP " + session.stepsUsed + "/" + session.totalSteps
+                + " | crosshair: " + crosshair
+                + " | @" + String.format("%.1f %.1f %.1f", puppet.getX(), puppet.getY(), puppet.getZ()) + " yaw " + Math.round(session.yaw) + " pitch " + Math.round(session.pitch)
+                + " | hp " + Math.round(puppet.getHealth()) + (puppet.onGround() ? "" : " airborne") + (puppet.isInWater() ? " in water" : "")
+                + " | hand " + itemId(puppet.getMainHandItem())
+                + " | hostiles: " + (hostiles.isEmpty() ? "none within 16" : String.join(", ", hostiles))
+                + (this.stepNotes.isEmpty() ? "" : " | notes: " + String.join("; ", this.stepNotes));
+        this.stepNotes.clear();
+        boolean last = session.stepsUsed >= session.totalSteps;
+        SNAPSHOT.request(puppet.getId(), this.dir.resolve("possess_view.png"), 256, result -> {
+            this.event(line + " | view: " + (result.startsWith("SNAPSHOT") ? "possess_view.png" : result));
+            session.awaitingSnapshot = false;
+            if (last && this.possession == session) {
+                this.server.execute(() -> this.releasePossession("out of steps"));
+            }
+        });
+    }
+
+    private void tickPossession(PuppetEntity puppet) {
+        PuppetPossession session = this.possession;
+        String result = session.tick(puppet, this);
+        if (result != null && !result.isEmpty()) {
+            this.stepNotes.add(result);
+        } else if ("".equals(result)) {
+            session.stepsUsed++;
+            this.reportStep(puppet);
+        }
+        if (!session.stepRunning && !session.awaitingSnapshot && ++session.idleTicks > PuppetPossession.IDLE_RELEASE_TICKS) {
+            this.releasePossession("no input from Claude for 60s");
+        }
+    }
+
+    public void startPossessBreak(BlockPos pos) {
+        this.breakPos = pos;
+        this.breakProgress = 0;
+        this.breakApproachTicks = 0;
+    }
+
+    /** Mining in the crosshair while possessed (no walking to it). Returns true when done or impossible. **/
+    public boolean tickPossessBreak(PuppetEntity puppet) {
+        if (this.breakPos == null) {
+            return true;
+        }
+        if (puppet.getEyePosition().distanceTo(Vec3.atCenterOf(this.breakPos)) > REACH + 0.5D) {
+            this.stepNotes.add("hit: block out of reach");
+            this.breakPos = null;
+            return true;
+        }
+        boolean done = this.tickBreak(puppet);
+        if (done) {
+            this.breakPos = null;
+        }
+        return done || this.breakPos == null;
+    }
+
+    public void possessUse(PuppetEntity puppet, BlockPos pos) {
+        this.useItem(puppet, pos);
+    }
+
+    public void possessPlace(PuppetEntity puppet, BlockPos pos, String blockId) {
+        this.place(puppet, pos, blockId);
+    }
+
     private void writeEffort() {
         if (this.dir == null) {
             return;
@@ -469,6 +617,7 @@ public class PuppetBridge {
             puppet = this.spawnPuppet(player);
         }
         this.puppetId = puppet != null ? puppet.getUUID() : null;
+        this.tankWanted = puppet != null && puppet.isTank();
         this.followOwner();
         this.respawnTimer = -1;
         this.active = true;
@@ -675,6 +824,9 @@ public class PuppetBridge {
                 this.puppetId = puppet != null ? puppet.getUUID() : null;
                 this.removeStrayPuppets(oldId);
                 this.followOwner();
+                if (puppet != null && this.tankWanted) {
+                    puppet.setTank(true);
+                }
                 this.event("PUPPET RESPAWNED next to " + owner.getName().getString());
             } else {
                 this.respawnTimer = 100;
@@ -951,6 +1103,30 @@ public class PuppetBridge {
                     ItemStack stack = this.itemStack(args[0]);
                     puppet.setItemSlot(puppet.getEquipmentSlotForItem(stack), stack);
                 }
+                case "possess" -> {
+                    this.startPossession(args.length > 0 ? Math.max(1, Math.min(30, Integer.parseInt(args[0]))) : 10);
+                    return;
+                }
+                case "release" -> {
+                    this.releasePossession("released by Claude");
+                    return;
+                }
+                case "step" -> {
+                    if (this.possession == null || puppet == null) {
+                        this.event("FAIL step: not possessing the puppet");
+                        return;
+                    }
+                    if (this.possession.stepRunning || this.possession.awaitingSnapshot) {
+                        this.event("FAIL step: previous step still running");
+                        return;
+                    }
+                    this.possession.queueStep(rest);
+                    return;
+                }
+                case "tank" -> {
+                    this.setTank(null, args.length == 0 || "on".equalsIgnoreCase(args[0]));
+                    return;
+                }
                 case "undo" -> {
                     int count = args.length > 0 ? Integer.parseInt(args[0]) : 1;
                     for (int i = 0; i < count; i++) {
@@ -1020,6 +1196,14 @@ public class PuppetBridge {
     }
 
     private void setIdle() {
+        if (this.possession != null) {
+            PuppetEntity possessed = this.getPuppet();
+            if (possessed != null) {
+                this.possession.end(possessed);
+            }
+            this.possession = null;
+            this.event("POSSESS ended: another order took over");
+        }
         this.mode = Mode.IDLE;
         this.stuckTicks = 0;
         this.attackTarget = null;
@@ -1424,6 +1608,11 @@ public class PuppetBridge {
                 }
                 this.fightTick(puppet, living);
             }
+            case POSSESS -> {
+                if (this.possession != null) {
+                    this.tickPossession(puppet);
+                }
+            }
             case BREAK -> {
                 if (this.breakPos == null) {
                     this.mode = Mode.IDLE;
@@ -1649,7 +1838,8 @@ public class PuppetBridge {
         // One-line summary, cheap for Claude to read.
         StringBuilder status = new StringBuilder();
         if (puppet != null) {
-            status.append("puppet ").append(Math.round(puppet.getHealth())).append("hp ").append(this.mode.name().toLowerCase())
+            status.append("puppet ").append(Math.round(puppet.getHealth())).append("hp").append(puppet.isTank() ? "(tank)" : "").append(" ").append(this.mode.name().toLowerCase())
+                    .append(this.possession != null ? " " + this.possession.stepsUsed + "/" + this.possession.totalSteps : "")
                     .append(" @").append(String.format("%.0f %.0f %.0f", puppet.getX(), puppet.getY(), puppet.getZ()))
                     .append(" hand:").append(itemId(puppet.getMainHandItem())).append(" bag:").append(this.inventorySummary(puppet));
         } else {
