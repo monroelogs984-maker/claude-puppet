@@ -297,7 +297,7 @@ public class PuppetBridge {
         }
         if (event.getEntity() instanceof ServerPlayer player) {
             this.event("DEATH " + event.getSource().getLocalizedDeathMessage(player).getString());
-        } else if (event.getEntity() instanceof PuppetEntity puppet && puppet.getUUID().equals(this.puppetId)) {
+        } else if (event.getEntity() instanceof PuppetEntity puppet && puppet.getUUID().equals(this.puppetId) && this.respawnTimer <= 0) {
             this.event("PUPPET DIED: " + event.getSource().getLocalizedDeathMessage(puppet).getString() + " (respawning next to the owner in 10s)");
             this.setIdle();
             this.respawnTimer = 200;
@@ -335,8 +335,10 @@ public class PuppetBridge {
         if (this.respawnTimer > 0 && --this.respawnTimer == 0) {
             ServerPlayer owner = this.getOwner();
             if (owner != null) {
+                UUID oldId = this.puppetId;
                 PuppetEntity puppet = this.spawnPuppet(owner);
                 this.puppetId = puppet != null ? puppet.getUUID() : null;
+                this.removeStrayPuppets(oldId);
                 this.event("PUPPET RESPAWNED next to " + owner.getName().getString());
             } else {
                 this.respawnTimer = 100;
@@ -345,6 +347,9 @@ public class PuppetBridge {
 
         if (this.ticks % 5 == 0) {
             this.readCommands();
+        }
+        if (this.ticks % 100 == 0 && this.respawnTimer <= 0) {
+            this.removeStrayPuppets(null);
         }
         this.tickPuppet();
         if (this.ticks % 20 == 0) {
@@ -1085,6 +1090,24 @@ public class PuppetBridge {
             }
         }
         return null;
+    }
+
+    /**
+     * Removes every loaded puppet except the current one. A puppet whose death didn't fully complete (a mod cancelled
+     * or repeated the death) could otherwise linger next to its respawned replacement.
+     */
+    private void removeStrayPuppets(UUID reportId) {
+        if (this.puppetId == null) {
+            return;
+        }
+        for (ServerLevel level : this.server.getAllLevels()) {
+            for (Entity entity : level.getAllEntities()) {
+                if (entity instanceof PuppetEntity stray && !stray.getUUID().equals(this.puppetId) && !stray.isRemoved()) {
+                    stray.discard();
+                    this.event("PUPPET removed a stray old body at " + fmt(stray.position()));
+                }
+            }
+        }
     }
 
     private ServerPlayer getOwner() {
