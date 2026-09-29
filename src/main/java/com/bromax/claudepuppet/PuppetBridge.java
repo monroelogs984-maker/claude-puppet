@@ -434,9 +434,20 @@ public class PuppetBridge {
         if (this.ticks % 100 == 0 && this.respawnTimer <= 0) {
             this.removeStrayPuppets(null);
         }
-        this.tickPuppet();
+        // Never let a puppet job or another mod's item/block take the world down: log it and stand down instead.
+        try {
+            this.tickPuppet();
+        } catch (Exception e) {
+            this.event("ERROR puppet job crashed and was stopped: " + e);
+            e.printStackTrace();
+            this.followOwner();
+        }
         if (this.ticks % 20 == 0) {
-            this.writeState();
+            try {
+                this.writeState();
+            } catch (Exception e) {
+                this.event("ERROR writing state: " + e);
+            }
         }
     }
 
