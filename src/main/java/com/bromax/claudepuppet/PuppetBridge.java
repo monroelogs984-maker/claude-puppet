@@ -1008,8 +1008,18 @@ public class PuppetBridge {
                 }
                 case "use" -> {
                     this.requirePuppet(puppet);
+                    boolean sneakUse = args.length > 0 && args[0].startsWith("sneak");
+                    boolean wasSneaking = puppet.isShiftKeyDown();
+                    if (sneakUse) {
+                        puppet.setShiftKeyDown(true);
+                    }
                     this.useItem(puppet, null);
+                    puppet.setShiftKeyDown(wasSneaking);
                     return;
+                }
+                case "sneak" -> {
+                    this.requirePuppet(puppet);
+                    puppet.setShiftKeyDown(args.length == 0 || "on".equalsIgnoreCase(args[0]));
                 }
                 case "useon" -> {
                     this.requirePuppet(puppet);
@@ -1306,6 +1316,7 @@ public class PuppetBridge {
         fake.getInventory().clearContent();
         fake.setItemInHand(InteractionHand.MAIN_HAND, puppet.getMainHandItem().copy());
         fake.setItemInHand(InteractionHand.OFF_HAND, puppet.getOffhandItem().copy());
+        fake.setShiftKeyDown(puppet.isShiftKeyDown()); // Sneak-use items (e.g. Lycanites charges only throw while sneaking).
         return fake;
     }
 
