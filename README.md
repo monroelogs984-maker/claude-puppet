@@ -16,6 +16,21 @@ singleplayer world: read chat, talk, run commands and control a mock-player mob,
 
 `cmd` runs commands as the server at op level, so they work with cheats off (the world's cheats flag isn't changed).
 
+## Effort levels
+
+`/claudepuppet effort <off|low|normal|high>` (default low) controls what wakes Claude up, to keep it cheap:
+
+| Level | Claude responds to |
+|---|---|
+| off | nothing (the puppet keeps working and looking after itself) |
+| low | chat that mentions "claude" or starts with `!` |
+| normal | all chat, deaths, finished or failed jobs |
+| high | everything: damage, fights, command output |
+
+The puppet handles routine work itself: it announces finished jobs in chat (`[Puppet] Gathered 16 wood.`), goes back to
+following the owner afterwards, fights back against mobs that hit it, and eats from its backpack below half health.
+`status.txt` is a one-line summary for cheap reads.
+
 ## The puppet
 
 A pathfinding mob with the player model and a robot skin (`make_skin.py` generates it). 150 health, regenerates out

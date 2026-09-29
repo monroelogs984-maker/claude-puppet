@@ -154,6 +154,12 @@ public class PuppetBridge {
 
     private final Map<UUID, Long> lastHurtEvent = new HashMap<>();
 
+    /** How much Claude listens: off, low (default), normal or high. Read by Claude's watcher from effort.txt. **/
+    private String effort = "low";
+    private static final List<String> EFFORT_LEVELS = List.of("off", "low", "normal", "high");
+    /** True while fighting back on its own; when that fight ends it quietly resumes following. **/
+    private boolean selfDefense = false;
+
 
     // ==================================================
     //                  /claudepuppet
@@ -163,6 +169,14 @@ public class PuppetBridge {
                 .requires(source -> source.isPlayer() && (source.getServer().isSingleplayerOwner(source.getPlayer().getGameProfile()) || source.hasPermission(2)))
                 .executes(context -> this.activate(context.getSource().getPlayer()))
                 .then(Commands.literal("off").executes(context -> this.deactivate(context.getSource().getPlayer(), true)))
+                .then(Commands.literal("effort")
+                        .executes(context -> {
+                            context.getSource().sendSystemMessage(Component.literal("Claude's effort: " + this.effort + " (off, low, normal, high)").withStyle(ChatFormatting.GRAY));
+                            return Command.SINGLE_SUCCESS;
+                        })
+                        .then(Commands.argument("level", com.mojang.brigadier.arguments.StringArgumentType.word())
+                                .suggests((context, builder) -> net.minecraft.commands.SharedSuggestionProvider.suggest(EFFORT_LEVELS, builder))
+                                .executes(context -> this.setEffort(context.getSource(), com.mojang.brigadier.arguments.StringArgumentType.getString(context, "level")))))
                 .then(Commands.literal("here").executes(context -> {
                     PuppetEntity puppet = this.getPuppet();
                     if (puppet == null) {
@@ -171,6 +185,36 @@ public class PuppetBridge {
                     this.bringTo(puppet, context.getSource().getPlayer());
                     return Command.SINGLE_SUCCESS;
                 })));
+    }
+
+    private static final Map<String, String> EFFORT_INFO = Map.of(
+            "off", "Claude won't respond; the puppet keeps doing its job and looking after itself.",
+            "low", "Claude only responds when chat mentions \"claude\" or starts with \"!\".",
+            "normal", "Claude responds to all chat, deaths and finished or failed jobs.",
+            "high", "Claude follows everything: damage, fights, command output.");
+
+    private int setEffort(CommandSourceStack source, String level) {
+        level = level.toLowerCase();
+        if (!EFFORT_LEVELS.contains(level)) {
+            source.sendSystemMessage(Component.literal("Unknown effort level; use off, low, normal or high.").withStyle(ChatFormatting.RED));
+            return 0;
+        }
+        this.effort = level;
+        this.writeEffort();
+        source.sendSystemMessage(Component.literal("Claude's effort: " + level + ". " + EFFORT_INFO.get(level)).withStyle(ChatFormatting.GRAY));
+        this.event("EFFORT " + level);
+        return Command.SINGLE_SUCCESS;
+    }
+
+    private void writeEffort() {
+        if (this.dir == null) {
+            return;
+        }
+        try {
+            Files.writeString(this.dir.resolve("effort.txt"), this.effort + "\n", StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
 
     private int activate(ServerPlayer player) {
@@ -184,6 +228,14 @@ public class PuppetBridge {
                 Files.createFile(in);
             }
             this.readOffset = Files.size(in); // Only new commands.
+            Path effortFile = this.dir.resolve("effort.txt");
+            if (Files.exists(effortFile)) {
+                String saved = Files.readString(effortFile).trim().toLowerCase();
+                if (EFFORT_LEVELS.contains(saved)) {
+                    this.effort = saved;
+                }
+            }
+            this.writeEffort();
         } catch (IOException e) {
             player.sendSystemMessage(Component.literal("Claude Puppet couldn't create " + this.dir + ": " + e).withStyle(ChatFormatting.RED));
             return 0;
@@ -202,11 +254,11 @@ public class PuppetBridge {
             puppet = this.spawnPuppet(player);
         }
         this.puppetId = puppet != null ? puppet.getUUID() : null;
-        this.setIdle();
+        this.followOwner();
         this.respawnTimer = -1;
         this.active = true;
 
-        player.sendSystemMessage(Component.literal("Claude is tuned in. ").withStyle(ChatFormatting.GRAY)
+        player.sendSystemMessage(Component.literal("Claude is tuned in (effort: " + this.effort + ", change with /claudepuppet effort). ").withStyle(ChatFormatting.GRAY)
                 .append(Component.literal("(bridge folder: " + this.dir + ")").withStyle(ChatFormatting.DARK_GRAY)));
         this.event("ACTIVATED by " + player.getName().getString() + " in " + player.level().dimension().location() + " at " + fmt(player.position()));
         return Command.SINGLE_SUCCESS;
@@ -267,6 +319,15 @@ public class PuppetBridge {
         if (!this.active || !(entity instanceof ServerPlayer || entity instanceof PuppetEntity) || event.getNewDamage() <= 0) {
             return;
         }
+        // Self-defence: fight back against mobs (never players) when not already busy fighting.
+        if (entity instanceof PuppetEntity && entity.getUUID().equals(this.puppetId) && entity.isAlive()
+                && event.getSource().getEntity() instanceof LivingEntity attacker && !(attacker instanceof net.minecraft.world.entity.player.Player)
+                && attacker.isAlive() && (this.mode == Mode.IDLE || this.mode == Mode.FOLLOW)) {
+            this.setIdle();
+            this.attackTarget = attacker.getUUID();
+            this.mode = Mode.ATTACK;
+            this.selfDefense = true;
+        }
         long now = entity.level().getGameTime();
         Long last = this.lastHurtEvent.get(entity.getUUID());
         if (last != null && now - last < 100) {
@@ -316,6 +377,27 @@ public class PuppetBridge {
         }
     }
 
+    /** A short automatic status line from the puppet itself (so Claude doesn't need to be woken to report it). **/
+    private void announce(String text) {
+        this.server.getPlayerList().broadcastSystemMessage(Component.literal("[Puppet] " + text).withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC), false);
+    }
+
+    /** A job ended: log it, tell the players, and go back to following the owner. **/
+    private void finishTask(String eventLine, String announcement) {
+        this.event(eventLine);
+        if (announcement != null) {
+            this.announce(announcement);
+        }
+        this.followOwner();
+    }
+
+    private void followOwner() {
+        this.setIdle();
+        this.targetName = null;
+        this.followDistance = 3;
+        this.mode = Mode.FOLLOW;
+    }
+
     private void say(String text) {
         MutableComponent message = Component.literal("<").append(Component.literal("Claude").withStyle(style -> style.withColor(CLAUDE_COLOR))).append("> " + text);
         this.server.getPlayerList().broadcastSystemMessage(message, false);
@@ -339,6 +421,7 @@ public class PuppetBridge {
                 PuppetEntity puppet = this.spawnPuppet(owner);
                 this.puppetId = puppet != null ? puppet.getUUID() : null;
                 this.removeStrayPuppets(oldId);
+                this.followOwner();
                 this.event("PUPPET RESPAWNED next to " + owner.getName().getString());
             } else {
                 this.respawnTimer = 100;
@@ -945,7 +1028,24 @@ public class PuppetBridge {
     // ==================================================
     private void tickPuppet() {
         PuppetEntity puppet = this.getPuppet();
-        if (puppet == null || this.mode == Mode.IDLE) {
+        if (puppet == null) {
+            return;
+        }
+        // Eats from the backpack when below half health.
+        if (this.ticks % 40 == 0 && puppet.getHealth() < puppet.getMaxHealth() / 2) {
+            for (int i = 0; i < puppet.getInventory().getContainerSize(); i++) {
+                ItemStack stack = puppet.getInventory().getItem(i);
+                FoodProperties food = stack.getFoodProperties(puppet);
+                if (food != null && food.nutrition() > 0) {
+                    puppet.heal(food.nutrition() * 2.0F);
+                    puppet.level().playSound(null, puppet.getX(), puppet.getY(), puppet.getZ(), SoundEvents.GENERIC_EAT, SoundSource.NEUTRAL, 1.0F, 1.0F);
+                    this.event("ATE " + itemId(stack.copyWithCount(1)) + " (auto), health now " + Math.round(puppet.getHealth()));
+                    stack.shrink(1);
+                    break;
+                }
+            }
+        }
+        if (this.mode == Mode.IDLE) {
             return;
         }
         if (this.attackCooldown > 0) {
@@ -956,12 +1056,12 @@ public class PuppetBridge {
             case WALK -> {
                 double distance = puppet.position().distanceTo(this.walkTarget);
                 if (distance < 1.5D) {
-                    this.mode = Mode.IDLE;
                     this.event("DONE walkto, puppet at " + fmt(puppet.position()));
+                    this.setIdle(); // Stays at the destination.
                 } else if (puppet.getNavigation().isDone()) {
                     if (++this.stuckTicks > 40) {
-                        this.mode = Mode.IDLE;
-                        this.event("STUCK walkto: no path, puppet at " + fmt(puppet.position()) + ", " + Math.round(distance) + " blocks from target");
+                        this.finishTask("STUCK walkto: no path, puppet at " + fmt(puppet.position()) + ", " + Math.round(distance) + " blocks from target",
+                                "Couldn't find a path there, coming back.");
                     } else if (this.stuckTicks % 10 == 0) {
                         puppet.getNavigation().moveTo(this.walkTarget.x, this.walkTarget.y, this.walkTarget.z, this.walkSpeed);
                     }
@@ -994,8 +1094,10 @@ public class PuppetBridge {
             case ATTACK -> {
                 Entity target = this.attackTarget != null ? ((ServerLevel) puppet.level()).getEntity(this.attackTarget) : null;
                 if (!(target instanceof LivingEntity living) || !living.isAlive()) {
-                    this.setIdle();
-                    this.event("DONE attack: target " + (target == null ? "gone" : "dead"));
+                    boolean quiet = this.selfDefense;
+                    this.selfDefense = false;
+                    this.finishTask((quiet ? "DONE self-defence" : "DONE attack") + ": target " + (target == null ? "gone" : "dead"),
+                            quiet ? null : "Target down.");
                     return;
                 }
                 this.fightTick(puppet, living);
@@ -1004,15 +1106,14 @@ public class PuppetBridge {
                 if (this.breakPos == null) {
                     this.mode = Mode.IDLE;
                 } else if (this.tickBreak(puppet)) {
-                    this.event("DONE break, holding " + itemId(puppet.getMainHandItem()));
-                    this.setIdle();
+                    this.finishTask("DONE break, holding " + itemId(puppet.getMainHandItem()), "Block mined.");
                 }
             }
             case GATHER -> {
                 if (this.breakPos == null) {
                     if (this.gatherCount >= this.gatherWanted) {
-                        this.event("DONE gather " + this.gatherName + ": " + this.gatherCount + " blocks, inventory: " + this.inventorySummary(puppet));
-                        this.setIdle();
+                        this.finishTask("DONE gather " + this.gatherName + ": " + this.gatherCount + " blocks, inventory: " + this.inventorySummary(puppet),
+                                "Gathered " + this.gatherCount + " " + this.gatherName + ".");
                         return;
                     }
                     if (this.ticks % 10 != 0) {
@@ -1022,8 +1123,8 @@ public class PuppetBridge {
                     this.breakProgress = 0;
                     this.breakApproachTicks = 0;
                     if (this.breakPos == null) {
-                        this.event("DONE gather " + this.gatherName + ": ran out of reachable blocks within 24 after " + this.gatherCount + ", inventory: " + this.inventorySummary(puppet));
-                        this.setIdle();
+                        this.finishTask("DONE gather " + this.gatherName + ": ran out of reachable blocks within 24 after " + this.gatherCount + ", inventory: " + this.inventorySummary(puppet),
+                                "Ran out of " + this.gatherName + " nearby after " + this.gatherCount + ".");
                     }
                 } else if (this.tickBreak(puppet)) {
                     this.gatherCount++;
@@ -1221,6 +1322,35 @@ public class PuppetBridge {
                 entities.add(describe(entity, center));
             }
             state.add("nearbyEntities", entities);
+        }
+
+        // One-line summary, cheap for Claude to read.
+        StringBuilder status = new StringBuilder();
+        if (puppet != null) {
+            status.append("puppet ").append(Math.round(puppet.getHealth())).append("hp ").append(this.mode.name().toLowerCase())
+                    .append(" @").append(String.format("%.0f %.0f %.0f", puppet.getX(), puppet.getY(), puppet.getZ()))
+                    .append(" hand:").append(itemId(puppet.getMainHandItem())).append(" bag:").append(this.inventorySummary(puppet));
+        } else {
+            status.append("puppet ").append(this.respawnTimer > 0 ? "dead" : "missing");
+        }
+        if (owner != null) {
+            status.append(" | ").append(owner.getName().getString()).append(" ").append(Math.round(owner.getHealth())).append("hp @")
+                    .append(String.format("%.0f %.0f %.0f", owner.getX(), owner.getY(), owner.getZ())).append(" ").append(owner.level().dimension().location().getPath())
+                    .append(" hand:").append(itemId(owner.getMainHandItem()));
+        }
+        if (center != null) {
+            Map<String, Integer> nearbyCounts = new LinkedHashMap<>();
+            for (Entity entity : center.level().getEntities(center, center.getBoundingBox().inflate(24), entity -> entity instanceof LivingEntity && !(entity instanceof ServerPlayer) && !(entity instanceof PuppetEntity))) {
+                nearbyCounts.merge(BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath(), 1, Integer::sum);
+            }
+            status.append(" | near:");
+            nearbyCounts.forEach((type, count) -> status.append(" ").append(type).append(count > 1 ? "x" + count : ""));
+        }
+        status.append(" | t").append(level.getDayTime() % 24000).append(" ").append(level.isThundering() ? "thunder" : level.isRaining() ? "rain" : "clear");
+        try {
+            Files.writeString(this.dir.resolve("status.txt"), status + "\n", StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            e.printStackTrace();
         }
 
         try {
