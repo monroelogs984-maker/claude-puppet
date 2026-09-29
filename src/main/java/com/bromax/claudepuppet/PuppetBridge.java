@@ -1,0 +1,1233 @@
+package com.bromax.claudepuppet;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.mojang.authlib.GameProfile;
+import com.mojang.brigadier.Command;
+import net.minecraft.ChatFormatting;
+import net.minecraft.commands.CommandSource;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+import net.minecraft.commands.arguments.EntityAnchorArgument;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.network.chat.TextColor;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.projectile.AbstractArrow;
+import net.minecraft.world.entity.projectile.ProjectileUtil;
+import net.minecraft.world.food.FoodProperties;
+import net.minecraft.world.item.BowItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec2;
+import net.minecraft.world.phys.Vec3;
+import net.neoforged.neoforge.common.util.FakePlayer;
+import net.neoforged.neoforge.common.util.FakePlayerFactory;
+import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.ServerChatEvent;
+import net.neoforged.neoforge.event.entity.living.LivingDamageEvent;
+import net.neoforged.neoforge.event.entity.living.LivingDeathEvent;
+import net.neoforged.neoforge.event.entity.player.AdvancementEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
+
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.function.Predicate;
+
+/**
+ * Server side of Claude Puppet (runs inside the singleplayer world's integrated server).
+ *
+ * <p>{@code /claudepuppet} (no cheats needed, singleplayer owner or op only) tunes Claude in and spawns (or finds)
+ * Claude's Puppet next to the player; {@code /claudepuppet off} tunes out and removes it; {@code /claudepuppet here}
+ * brings it to you.
+ *
+ * <p>Commands Claude appends to {@code claudepuppet/in.txt}, one per line:
+ * <pre>
+ * say &lt;text&gt;                chat as &lt;Claude&gt;
+ * cmd &lt;command&gt;             run any command as the server (op level), positioned at the puppet; output is logged
+ *
+ * walkto &lt;x&gt; &lt;y&gt; &lt;z&gt; [speed]  pathfind there (speed 1 = walk, 1.5 = run)
+ * follow [name] [dist]      keep following a player (default: the owner) or entity
+ * attack &lt;name|type&gt;       hunt the nearest match until it dies (shoots if holding a bow and carrying arrows)
+ * guard [name]              follow a player (default owner) and fight any hostile mob that comes near them
+ * gather &lt;what&gt; [count]     find, walk to, mine and collect blocks: wood | stone | a block id | #tag (default 16)
+ * stop                      stop whatever it's doing
+ * tp &lt;x&gt; &lt;y&gt; &lt;z&gt;  |  here   teleport the puppet (here = next to the owner)
+ * look &lt;x&gt; &lt;y&gt; &lt;z&gt;  |  lookat &lt;name|type&gt;
+ *
+ * break &lt;x&gt; &lt;y&gt; &lt;z&gt;       mine a block (takes real time for the held tool; drops go to the inventory)
+ * place &lt;x&gt; &lt;y&gt; &lt;z&gt; [block]   place a block from the inventory (or the held block); with a block id and none carried it's conjured
+ * use                       right-click with the held item (through a fake player named Claude)
+ * useon &lt;x&gt; &lt;y&gt; &lt;z&gt;       right-click a block with the held item
+ * eat                       eat the held food (heals the puppet)
+ * shoot &lt;name|type&gt;        one bow shot at a target (needs a bow in hand and arrows in the inventory)
+ *
+ * select &lt;item&gt;             move an item from the inventory into the hand (hand item goes to the inventory)
+ * stash                     put the hand item into the inventory
+ * take &lt;item&gt; [count]       conjure items straight into the inventory
+ * drop &lt;item|all&gt; [count]   drop items on the ground
+ * giveto [player] &lt;item&gt; [count]   toss items to a player (default owner)
+ * hold &lt;item&gt; [off]  |  equip &lt;item&gt;   conjure an item into a hand / armor slot
+ * jump  |  swing  |  vulnerable on|off
+ * </pre>
+ */
+public class PuppetBridge {
+    public static final PuppetBridge INSTANCE = new PuppetBridge();
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final TextColor CLAUDE_COLOR = TextColor.fromRgb(0xD97757);
+    private static final GameProfile FAKE_PROFILE = new GameProfile(UUID.fromString("c1a0de00-7075-4e74-8000-000000c1a0de"), "Claude");
+    private static final double REACH = 4.5D;
+
+    private MinecraftServer server;
+    private boolean active = false;
+    private Path dir;
+    private long readOffset = 0;
+    private UUID ownerId;
+    private UUID puppetId;
+    private int ticks = 0;
+    private int respawnTimer = -1;
+
+    // Puppet orders:
+    private enum Mode { IDLE, WALK, FOLLOW, ATTACK, GUARD, BREAK, GATHER }
+    private Mode mode = Mode.IDLE;
+    private Vec3 walkTarget;
+    private double walkSpeed = 1.0D;
+    private String targetName;
+    private double followDistance = 3;
+    private UUID attackTarget;
+    private int attackCooldown = 0;
+    private int stuckTicks = 0;
+
+    // Mining (break command and gather job):
+    private BlockPos breakPos;
+    private float breakProgress = 0;
+    private int breakApproachTicks = 0;
+    private Predicate<BlockState> gatherFilter;
+    private String gatherName;
+    private int gatherWanted = 0;
+    private int gatherCount = 0;
+    private final Set<BlockPos> gatherBlacklist = new HashSet<>();
+
+    private final Map<UUID, Long> lastHurtEvent = new HashMap<>();
+
+
+    // ==================================================
+    //                  /claudepuppet
+    // ==================================================
+    public void onRegisterCommands(RegisterCommandsEvent event) {
+        event.getDispatcher().register(Commands.literal("claudepuppet")
+                .requires(source -> source.isPlayer() && (source.getServer().isSingleplayerOwner(source.getPlayer().getGameProfile()) || source.hasPermission(2)))
+                .executes(context -> this.activate(context.getSource().getPlayer()))
+                .then(Commands.literal("off").executes(context -> this.deactivate(context.getSource().getPlayer(), true)))
+                .then(Commands.literal("here").executes(context -> {
+                    PuppetEntity puppet = this.getPuppet();
+                    if (puppet == null) {
+                        return this.activate(context.getSource().getPlayer());
+                    }
+                    this.bringTo(puppet, context.getSource().getPlayer());
+                    return Command.SINGLE_SUCCESS;
+                })));
+    }
+
+    private int activate(ServerPlayer player) {
+        this.server = player.getServer();
+        this.ownerId = player.getUUID();
+        this.dir = this.server.getServerDirectory().resolve("claudepuppet");
+        try {
+            Files.createDirectories(this.dir);
+            Path in = this.dir.resolve("in.txt");
+            if (!Files.exists(in)) {
+                Files.createFile(in);
+            }
+            this.readOffset = Files.size(in); // Only new commands.
+        } catch (IOException e) {
+            player.sendSystemMessage(Component.literal("Claude Puppet couldn't create " + this.dir + ": " + e).withStyle(ChatFormatting.RED));
+            return 0;
+        }
+
+        // Find an existing puppet near the player, or spawn one.
+        PuppetEntity puppet = this.getPuppet();
+        if (puppet == null) {
+            List<PuppetEntity> nearby = player.serverLevel().getEntitiesOfClass(PuppetEntity.class, player.getBoundingBox().inflate(128));
+            puppet = nearby.isEmpty() ? null : nearby.get(0);
+            for (int i = 1; i < nearby.size(); i++) {
+                nearby.get(i).discard();
+            }
+        }
+        if (puppet == null) {
+            puppet = this.spawnPuppet(player);
+        }
+        this.puppetId = puppet != null ? puppet.getUUID() : null;
+        this.setIdle();
+        this.respawnTimer = -1;
+        this.active = true;
+
+        player.sendSystemMessage(Component.literal("Claude is tuned in. ").withStyle(ChatFormatting.GRAY)
+                .append(Component.literal("(bridge folder: " + this.dir + ")").withStyle(ChatFormatting.DARK_GRAY)));
+        this.event("ACTIVATED by " + player.getName().getString() + " in " + player.level().dimension().location() + " at " + fmt(player.position()));
+        return Command.SINGLE_SUCCESS;
+    }
+
+    private PuppetEntity spawnPuppet(ServerPlayer player) {
+        PuppetEntity puppet = ClaudePuppet.PUPPET.get().create(player.serverLevel());
+        if (puppet != null) {
+            this.bringTo(puppet, player);
+            player.serverLevel().addFreshEntity(puppet);
+        }
+        return puppet;
+    }
+
+    private int deactivate(ServerPlayer player, boolean removePuppet) {
+        PuppetEntity puppet = this.getPuppet();
+        if (removePuppet && puppet != null) {
+            puppet.discard();
+        }
+        this.active = false;
+        this.setIdle();
+        this.event("DEACTIVATED" + (player != null ? " by " + player.getName().getString() : " (world closed)"));
+        if (player != null) {
+            player.sendSystemMessage(Component.literal("Claude has tuned out.").withStyle(ChatFormatting.GRAY));
+        }
+        return Command.SINGLE_SUCCESS;
+    }
+
+    public void onServerStopping(ServerStoppingEvent event) {
+        if (this.active) {
+            this.deactivate(null, false);
+        }
+    }
+
+    private void bringTo(PuppetEntity puppet, ServerPlayer player) {
+        Vec3 side = Vec3.directionFromRotation(0, player.getYRot() + 90).scale(1.5);
+        if (puppet.level() != player.level()) {
+            puppet.changeDimension(new net.minecraft.world.level.portal.DimensionTransition(player.serverLevel(), player.position().add(side), Vec3.ZERO, player.getYRot(), 0, net.minecraft.world.level.portal.DimensionTransition.DO_NOTHING));
+        } else {
+            puppet.moveTo(player.getX() + side.x, player.getY(), player.getZ() + side.z, player.getYRot(), 0);
+        }
+        puppet.getNavigation().stop();
+    }
+
+
+    // ==================================================
+    //                 Chat and Events
+    // ==================================================
+    public void onChat(ServerChatEvent event) {
+        if (this.active) {
+            this.event("CHAT <" + event.getPlayer().getName().getString() + "> " + event.getRawText());
+        }
+    }
+
+    /** A player or the puppet took damage (at most one event each per 5 seconds, so a fight doesn't flood the log). **/
+    public void onPlayerHurt(LivingDamageEvent.Post event) {
+        LivingEntity entity = event.getEntity();
+        if (!this.active || !(entity instanceof ServerPlayer || entity instanceof PuppetEntity) || event.getNewDamage() <= 0) {
+            return;
+        }
+        long now = entity.level().getGameTime();
+        Long last = this.lastHurtEvent.get(entity.getUUID());
+        if (last != null && now - last < 100) {
+            return;
+        }
+        this.lastHurtEvent.put(entity.getUUID(), now);
+        Entity attacker = event.getSource().getEntity();
+        String who = entity instanceof PuppetEntity ? "PUPPET" : entity.getName().getString();
+        this.event("HURT " + who + " -" + Math.round(event.getNewDamage() * 10) / 10.0 + " from " + event.getSource().getMsgId()
+                + (attacker != null ? " (" + BuiltInRegistries.ENTITY_TYPE.getKey(attacker.getType()) + ")" : "") + ", health now " + Math.round(entity.getHealth() * 10) / 10.0);
+    }
+
+    public void onChangedDimension(PlayerEvent.PlayerChangedDimensionEvent event) {
+        if (this.active) {
+            this.event("DIMENSION " + event.getEntity().getName().getString() + " -> " + event.getTo().location());
+        }
+    }
+
+    public void onAdvancement(AdvancementEvent.AdvancementEarnEvent event) {
+        if (this.active && event.getAdvancement().value().display().isPresent()) {
+            this.event("ADVANCEMENT " + event.getEntity().getName().getString() + ": " + event.getAdvancement().value().display().get().getTitle().getString());
+        }
+    }
+
+    public void onLivingDeath(LivingDeathEvent event) {
+        if (!this.active) {
+            return;
+        }
+        if (event.getEntity() instanceof ServerPlayer player) {
+            this.event("DEATH " + event.getSource().getLocalizedDeathMessage(player).getString());
+        } else if (event.getEntity() instanceof PuppetEntity puppet && puppet.getUUID().equals(this.puppetId)) {
+            this.event("PUPPET DIED: " + event.getSource().getLocalizedDeathMessage(puppet).getString() + " (respawning next to the owner in 10s)");
+            this.setIdle();
+            this.respawnTimer = 200;
+        }
+    }
+
+    private void event(String line) {
+        if (this.dir == null) {
+            return;
+        }
+        try {
+            Files.writeString(this.dir.resolve("events.log"), "[" + LocalTime.now().format(TIME) + "] " + line + "\n",
+                    StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void say(String text) {
+        MutableComponent message = Component.literal("<").append(Component.literal("Claude").withStyle(style -> style.withColor(CLAUDE_COLOR))).append("> " + text);
+        this.server.getPlayerList().broadcastSystemMessage(message, false);
+    }
+
+
+    // ==================================================
+    //                      Tick
+    // ==================================================
+    public void onServerTick(ServerTickEvent.Post event) {
+        if (!this.active || this.server == null) {
+            return;
+        }
+        this.ticks++;
+
+        // Respawn after death:
+        if (this.respawnTimer > 0 && --this.respawnTimer == 0) {
+            ServerPlayer owner = this.getOwner();
+            if (owner != null) {
+                PuppetEntity puppet = this.spawnPuppet(owner);
+                this.puppetId = puppet != null ? puppet.getUUID() : null;
+                this.event("PUPPET RESPAWNED next to " + owner.getName().getString());
+            } else {
+                this.respawnTimer = 100;
+            }
+        }
+
+        if (this.ticks % 5 == 0) {
+            this.readCommands();
+        }
+        this.tickPuppet();
+        if (this.ticks % 20 == 0) {
+            this.writeState();
+        }
+    }
+
+    private void readCommands() {
+        Path in = this.dir.resolve("in.txt");
+        try {
+            long size = Files.size(in);
+            if (size < this.readOffset) {
+                this.readOffset = 0;
+            }
+            if (size == this.readOffset) {
+                return;
+            }
+            String text;
+            try (RandomAccessFile file = new RandomAccessFile(in.toFile(), "r")) {
+                file.seek(this.readOffset);
+                byte[] bytes = new byte[(int) (size - this.readOffset)];
+                file.readFully(bytes);
+                text = new String(bytes, StandardCharsets.UTF_8);
+            }
+            int lastNewline = text.lastIndexOf('\n');
+            if (lastNewline < 0) {
+                return;
+            }
+            this.readOffset += text.substring(0, lastNewline + 1).getBytes(StandardCharsets.UTF_8).length;
+            for (String line : text.substring(0, lastNewline).split("\n")) {
+                line = line.trim();
+                if (!line.isEmpty()) {
+                    this.runCommand(line);
+                }
+            }
+        } catch (IOException e) {
+            this.event("ERROR reading in.txt: " + e);
+        }
+    }
+
+
+    // ==================================================
+    //                    Commands
+    // ==================================================
+    private void runCommand(String line) {
+        String[] parts = line.split(" ", 2);
+        String command = parts[0].toLowerCase();
+        String rest = parts.length > 1 ? parts[1].trim() : "";
+        String[] args = rest.isEmpty() ? new String[0] : rest.split("\\s+");
+        PuppetEntity puppet = this.getPuppet();
+        ServerPlayer owner = this.getOwner();
+        try {
+            switch (command) {
+                case "say" -> this.say(rest);
+                case "cmd" -> {
+                    this.runServerCommand(rest.startsWith("/") ? rest.substring(1) : rest, puppet, owner);
+                    return; // Output is logged as CMDOUT.
+                }
+                case "walkto" -> {
+                    this.requirePuppet(puppet);
+                    this.setIdle();
+                    this.walkTarget = new Vec3(Double.parseDouble(args[0]), Double.parseDouble(args[1]), Double.parseDouble(args[2]));
+                    this.walkSpeed = args.length > 3 ? Double.parseDouble(args[3]) : 1.0D;
+                    this.mode = Mode.WALK;
+                    puppet.getNavigation().moveTo(this.walkTarget.x, this.walkTarget.y, this.walkTarget.z, this.walkSpeed);
+                }
+                case "follow" -> {
+                    this.requirePuppet(puppet);
+                    this.setIdle();
+                    this.targetName = args.length > 0 ? args[0] : null;
+                    this.followDistance = args.length > 1 ? Double.parseDouble(args[1]) : 3;
+                    this.mode = Mode.FOLLOW;
+                }
+                case "guard" -> {
+                    this.requirePuppet(puppet);
+                    this.setIdle();
+                    this.targetName = args.length > 0 ? args[0] : null;
+                    this.followDistance = 4;
+                    this.mode = Mode.GUARD;
+                }
+                case "attack" -> {
+                    this.requirePuppet(puppet);
+                    Entity target = this.findEntity(puppet, args[0], 48);
+                    if (target == null) {
+                        this.event("FAIL attack: no '" + args[0] + "' within 48 blocks of the puppet");
+                        return;
+                    }
+                    this.setIdle();
+                    this.attackTarget = target.getUUID();
+                    this.mode = Mode.ATTACK;
+                    this.event("OK attack -> " + describe(target, puppet));
+                    return;
+                }
+                case "gather" -> {
+                    this.requirePuppet(puppet);
+                    this.setIdle();
+                    this.gatherFilter = this.blockFilter(args.length > 0 ? args[0] : "wood");
+                    this.gatherName = args.length > 0 ? args[0] : "wood";
+                    this.gatherWanted = args.length > 1 ? Integer.parseInt(args[1]) : 16;
+                    this.gatherCount = 0;
+                    this.gatherBlacklist.clear();
+                    this.mode = Mode.GATHER;
+                }
+                case "stop" -> {
+                    this.setIdle();
+                    if (puppet != null) {
+                        puppet.getNavigation().stop();
+                    }
+                }
+                case "tp" -> {
+                    this.requirePuppet(puppet);
+                    puppet.moveTo(Double.parseDouble(args[0]), Double.parseDouble(args[1]), Double.parseDouble(args[2]), puppet.getYRot(), 0);
+                    puppet.getNavigation().stop();
+                }
+                case "here" -> {
+                    this.requirePuppet(puppet);
+                    if (owner == null) {
+                        this.event("FAIL here: owner not online");
+                        return;
+                    }
+                    this.bringTo(puppet, owner);
+                }
+                case "look" -> {
+                    this.requirePuppet(puppet);
+                    this.lookAt(puppet, new Vec3(Double.parseDouble(args[0]), Double.parseDouble(args[1]), Double.parseDouble(args[2])));
+                }
+                case "lookat" -> {
+                    this.requirePuppet(puppet);
+                    Entity target = this.findEntity(puppet, args[0], 64);
+                    if (target == null) {
+                        this.event("FAIL lookat: no '" + args[0] + "' nearby");
+                        return;
+                    }
+                    this.lookAt(puppet, target.getEyePosition());
+                }
+
+                // Blocks and items:
+                case "break" -> {
+                    this.requirePuppet(puppet);
+                    this.setIdle();
+                    this.breakPos = BlockPos.containing(Double.parseDouble(args[0]), Double.parseDouble(args[1]), Double.parseDouble(args[2]));
+                    this.mode = Mode.BREAK;
+                }
+                case "place" -> {
+                    this.requirePuppet(puppet);
+                    BlockPos pos = BlockPos.containing(Double.parseDouble(args[0]), Double.parseDouble(args[1]), Double.parseDouble(args[2]));
+                    this.place(puppet, pos, args.length > 3 ? args[3] : null);
+                    return;
+                }
+                case "use" -> {
+                    this.requirePuppet(puppet);
+                    this.useItem(puppet, null);
+                    return;
+                }
+                case "useon" -> {
+                    this.requirePuppet(puppet);
+                    this.useItem(puppet, BlockPos.containing(Double.parseDouble(args[0]), Double.parseDouble(args[1]), Double.parseDouble(args[2])));
+                    return;
+                }
+                case "eat" -> {
+                    this.requirePuppet(puppet);
+                    this.eat(puppet);
+                    return;
+                }
+                case "shoot" -> {
+                    this.requirePuppet(puppet);
+                    Entity target = this.findEntity(puppet, args[0], 48);
+                    if (target == null) {
+                        this.event("FAIL shoot: no '" + args[0] + "' nearby");
+                        return;
+                    }
+                    if (!this.shoot(puppet, target)) {
+                        return;
+                    }
+                }
+
+                // Inventory:
+                case "select" -> {
+                    this.requirePuppet(puppet);
+                    Item item = this.item(args[0]);
+                    ItemStack taken = puppet.takeFromInventory(item, item.getDefaultMaxStackSize());
+                    if (taken.isEmpty()) {
+                        this.event("FAIL select: no " + args[0] + " in the inventory");
+                        return;
+                    }
+                    ItemStack previous = puppet.getMainHandItem();
+                    puppet.setItemSlot(EquipmentSlot.MAINHAND, taken);
+                    this.stashOrDrop(puppet, previous);
+                }
+                case "stash" -> {
+                    this.requirePuppet(puppet);
+                    ItemStack held = puppet.getMainHandItem();
+                    puppet.setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
+                    this.stashOrDrop(puppet, held);
+                }
+                case "take" -> {
+                    this.requirePuppet(puppet);
+                    Item item = this.item(args[0]);
+                    int count = args.length > 1 ? Integer.parseInt(args[1]) : 1;
+                    while (count > 0) {
+                        int amount = Math.min(count, item.getDefaultMaxStackSize());
+                        this.stashOrDrop(puppet, new ItemStack(item, amount));
+                        count -= amount;
+                    }
+                }
+                case "drop" -> {
+                    this.requirePuppet(puppet);
+                    if ("all".equals(args[0])) {
+                        for (ItemStack stack : puppet.getInventory().removeAllItems()) {
+                            puppet.spawnAtLocation(stack, 1);
+                        }
+                    } else {
+                        ItemStack taken = puppet.takeFromInventory(this.item(args[0]), args.length > 1 ? Integer.parseInt(args[1]) : 64);
+                        if (taken.isEmpty()) {
+                            this.event("FAIL drop: no " + args[0] + " in the inventory");
+                            return;
+                        }
+                        puppet.spawnAtLocation(taken, 1);
+                    }
+                }
+                case "giveto" -> {
+                    this.requirePuppet(puppet);
+                    boolean namedPlayer = args.length > 1 && !args[0].contains(":");
+                    ServerPlayer receiver = namedPlayer ? this.server.getPlayerList().getPlayerByName(args[0]) : owner;
+                    int itemArg = namedPlayer ? 1 : 0;
+                    if (receiver == null) {
+                        this.event("FAIL giveto: player not found");
+                        return;
+                    }
+                    ItemStack taken = puppet.takeFromInventory(this.item(args[itemArg]), args.length > itemArg + 1 ? Integer.parseInt(args[itemArg + 1]) : 64);
+                    if (taken.isEmpty()) {
+                        this.event("FAIL giveto: no " + args[itemArg] + " in the inventory");
+                        return;
+                    }
+                    this.toss(puppet, receiver, taken);
+                }
+                case "hold" -> {
+                    this.requirePuppet(puppet);
+                    ItemStack stack = this.itemStack(args[0]);
+                    puppet.setItemSlot(args.length > 1 && args[1].startsWith("off") ? EquipmentSlot.OFFHAND : EquipmentSlot.MAINHAND, stack);
+                }
+                case "equip" -> {
+                    this.requirePuppet(puppet);
+                    ItemStack stack = this.itemStack(args[0]);
+                    puppet.setItemSlot(puppet.getEquipmentSlotForItem(stack), stack);
+                }
+                case "jump" -> {
+                    this.requirePuppet(puppet);
+                    puppet.getJumpControl().jump();
+                }
+                case "swing" -> {
+                    this.requirePuppet(puppet);
+                    puppet.swing(InteractionHand.MAIN_HAND);
+                }
+                case "vulnerable" -> {
+                    this.requirePuppet(puppet);
+                    puppet.setInvulnerable(!"on".equalsIgnoreCase(args[0]));
+                }
+                default -> {
+                    this.event("FAIL unknown command: " + line);
+                    return;
+                }
+            }
+            this.event("OK " + line);
+        } catch (Exception e) {
+            this.event("FAIL " + line + " (" + e + ")");
+        }
+    }
+
+    private void requirePuppet(PuppetEntity puppet) {
+        if (puppet == null) {
+            throw new IllegalStateException(this.respawnTimer > 0 ? "the puppet is dead, respawning soon" : "no puppet (use /claudepuppet here)");
+        }
+    }
+
+    private void setIdle() {
+        this.mode = Mode.IDLE;
+        this.stuckTicks = 0;
+        this.attackTarget = null;
+        this.breakPos = null;
+        this.breakProgress = 0;
+        this.breakApproachTicks = 0;
+        PuppetEntity puppet = this.getPuppet();
+        if (puppet != null) {
+            puppet.getNavigation().stop();
+        }
+    }
+
+    private Item item(String id) {
+        return BuiltInRegistries.ITEM.getOptional(ResourceLocation.parse(id)).orElseThrow(() -> new IllegalArgumentException("unknown item " + id));
+    }
+
+    private ItemStack itemStack(String id) {
+        if ("air".equals(id) || "none".equals(id)) {
+            return ItemStack.EMPTY;
+        }
+        return new ItemStack(this.item(id));
+    }
+
+    private void stashOrDrop(PuppetEntity puppet, ItemStack stack) {
+        if (stack.isEmpty()) {
+            return;
+        }
+        ItemStack leftover = puppet.addToInventory(stack);
+        if (!leftover.isEmpty()) {
+            puppet.spawnAtLocation(leftover, 1);
+            this.event("INVENTORY FULL: dropped " + itemId(leftover));
+        }
+    }
+
+    private void toss(PuppetEntity puppet, Entity receiver, ItemStack stack) {
+        this.lookAt(puppet, receiver.getEyePosition());
+        puppet.swing(InteractionHand.MAIN_HAND);
+        ItemEntity itemEntity = new ItemEntity(puppet.level(), puppet.getX(), puppet.getEyeY() - 0.3, puppet.getZ(), stack);
+        Vec3 toward = receiver.position().subtract(puppet.position());
+        itemEntity.setDeltaMovement(toward.normalize().scale(Math.min(0.6, toward.length() * 0.12)).add(0, 0.25, 0));
+        itemEntity.setPickUpDelay(10);
+        itemEntity.setTarget(receiver.getUUID());
+        puppet.level().addFreshEntity(itemEntity);
+    }
+
+    private void lookAt(PuppetEntity puppet, Vec3 pos) {
+        puppet.lookAt(EntityAnchorArgument.Anchor.EYES, pos);
+        puppet.getLookControl().setLookAt(pos.x, pos.y, pos.z, 90, 90);
+    }
+
+    /** Runs a command as the server at op level, positioned at the puppet (or the owner), logging all output. **/
+    private void runServerCommand(String command, PuppetEntity puppet, ServerPlayer owner) {
+        Entity anchor = puppet != null ? puppet : owner;
+        ServerLevel level = anchor != null ? (ServerLevel) anchor.level() : this.server.overworld();
+        Vec3 pos = anchor != null ? anchor.position() : Vec3.atCenterOf(level.getSharedSpawnPos());
+        CommandSource output = new CommandSource() {
+            @Override
+            public void sendSystemMessage(Component component) {
+                PuppetBridge.this.event("CMDOUT " + component.getString());
+            }
+
+            @Override
+            public boolean acceptsSuccess() {
+                return true;
+            }
+
+            @Override
+            public boolean acceptsFailure() {
+                return true;
+            }
+
+            @Override
+            public boolean shouldInformAdmins() {
+                return false;
+            }
+        };
+        CommandSourceStack source = new CommandSourceStack(output, pos, Vec2.ZERO, level, 4, "Claude", Component.literal("Claude"), this.server, puppet);
+        this.event("CMD /" + command);
+        this.server.getCommands().performPrefixedCommand(source, command);
+    }
+
+
+    // ==================================================
+    //              Fake Player (item use)
+    // ==================================================
+    /** A fake player standing where the puppet is, looking where it looks, holding what it holds. **/
+    private FakePlayer fakePlayer(PuppetEntity puppet) {
+        FakePlayer fake = FakePlayerFactory.get((ServerLevel) puppet.level(), FAKE_PROFILE);
+        fake.moveTo(puppet.getX(), puppet.getY(), puppet.getZ(), puppet.getYHeadRot(), puppet.getXRot());
+        fake.setYHeadRot(puppet.getYHeadRot());
+        fake.getInventory().clearContent();
+        fake.setItemInHand(InteractionHand.MAIN_HAND, puppet.getMainHandItem().copy());
+        fake.setItemInHand(InteractionHand.OFF_HAND, puppet.getOffhandItem().copy());
+        return fake;
+    }
+
+    /** Copies the fake player's hands back to the puppet and moves anything it gained into the puppet's inventory. **/
+    private void syncBack(PuppetEntity puppet, FakePlayer fake) {
+        puppet.setItemSlot(EquipmentSlot.MAINHAND, fake.getMainHandItem().copy());
+        puppet.setItemSlot(EquipmentSlot.OFFHAND, fake.getOffhandItem().copy());
+        fake.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+        fake.setItemInHand(InteractionHand.OFF_HAND, ItemStack.EMPTY);
+        for (int i = 0; i < fake.getInventory().getContainerSize(); i++) {
+            ItemStack stack = fake.getInventory().removeItemNoUpdate(i);
+            this.stashOrDrop(puppet, stack);
+        }
+    }
+
+    private void useItem(PuppetEntity puppet, BlockPos pos) {
+        ItemStack held = puppet.getMainHandItem();
+        if (pos != null) {
+            this.lookAt(puppet, Vec3.atCenterOf(pos));
+        }
+        FakePlayer fake = this.fakePlayer(puppet);
+        ServerLevel level = (ServerLevel) puppet.level();
+        net.minecraft.world.InteractionResult result;
+        if (pos != null) {
+            Direction face = Direction.getNearest(puppet.getX() - (pos.getX() + 0.5), puppet.getEyeY() - (pos.getY() + 0.5), puppet.getZ() - (pos.getZ() + 0.5));
+            BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(pos).relative(face, 0.5), face, pos, false);
+            result = fake.gameMode.useItemOn(fake, level, fake.getMainHandItem(), InteractionHand.MAIN_HAND, hit);
+        } else {
+            result = fake.gameMode.useItem(fake, level, fake.getMainHandItem(), InteractionHand.MAIN_HAND);
+            if (fake.isUsingItem()) {
+                fake.releaseUsingItem(); // Bows and the like: fire immediately.
+            }
+        }
+        puppet.swing(InteractionHand.MAIN_HAND);
+        this.syncBack(puppet, fake);
+        this.event("USE " + itemId(held) + (pos != null ? " on " + BuiltInRegistries.BLOCK.getKey(level.getBlockState(pos).getBlock()) + " @ " + pos.toShortString() : "") + " -> " + result + ", now holding " + itemId(puppet.getMainHandItem()));
+    }
+
+    private void eat(PuppetEntity puppet) {
+        ItemStack held = puppet.getMainHandItem();
+        FoodProperties food = held.getFoodProperties(puppet);
+        if (food == null) {
+            this.event("FAIL eat: holding " + itemId(held) + ", which isn't food");
+            return;
+        }
+        puppet.heal(food.nutrition() * 2.0F);
+        puppet.level().playSound(null, puppet.getX(), puppet.getY(), puppet.getZ(), SoundEvents.GENERIC_EAT, SoundSource.NEUTRAL, 1.0F, 1.0F);
+        held.shrink(1);
+        this.event("ATE " + itemId(held.copyWithCount(1)) + ", health now " + Math.round(puppet.getHealth()));
+    }
+
+    private boolean shoot(PuppetEntity puppet, Entity target) {
+        ItemStack bow = puppet.getMainHandItem();
+        if (!(bow.getItem() instanceof BowItem)) {
+            this.event("FAIL shoot: not holding a bow");
+            return false;
+        }
+        ItemStack arrow = puppet.takeFromInventory(Items.ARROW, 1);
+        if (arrow.isEmpty()) {
+            this.event("FAIL shoot: no arrows in the inventory");
+            return false;
+        }
+        this.lookAt(puppet, target.getEyePosition());
+        AbstractArrow projectile = ProjectileUtil.getMobArrow(puppet, arrow, 1.0F, bow);
+        double dx = target.getX() - puppet.getX();
+        double dy = target.getY(0.3333D) - projectile.getY();
+        double dz = target.getZ() - puppet.getZ();
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        projectile.shoot(dx, dy + horizontal * 0.2D, dz, 1.6F, 2.0F);
+        puppet.level().addFreshEntity(projectile);
+        puppet.swing(InteractionHand.MAIN_HAND);
+        puppet.level().playSound(null, puppet.getX(), puppet.getY(), puppet.getZ(), SoundEvents.ARROW_SHOOT, SoundSource.NEUTRAL, 1.0F, 1.0F);
+        return true;
+    }
+
+    private void place(PuppetEntity puppet, BlockPos pos, String blockId) {
+        ServerLevel level = (ServerLevel) puppet.level();
+        if (!level.getBlockState(pos).canBeReplaced()) {
+            this.event("FAIL place: " + BuiltInRegistries.BLOCK.getKey(level.getBlockState(pos).getBlock()) + " is already at " + pos.toShortString());
+            return;
+        }
+        Block block = null;
+        if (blockId != null) {
+            block = BuiltInRegistries.BLOCK.getOptional(ResourceLocation.parse(blockId)).orElseThrow(() -> new IllegalArgumentException("unknown block " + blockId));
+            // Use one from the inventory if carried, otherwise conjure it.
+            puppet.takeFromInventory(block.asItem(), 1);
+        } else if (puppet.getMainHandItem().getItem() instanceof net.minecraft.world.item.BlockItem blockItem) {
+            block = blockItem.getBlock();
+            puppet.getMainHandItem().shrink(1);
+        }
+        if (block == null) {
+            this.event("FAIL place: no block given and not holding one");
+            return;
+        }
+        this.lookAt(puppet, Vec3.atCenterOf(pos));
+        puppet.swing(InteractionHand.MAIN_HAND);
+        level.setBlockAndUpdate(pos, block.defaultBlockState());
+        level.playSound(null, pos, block.defaultBlockState().getSoundType().getPlaceSound(), SoundSource.BLOCKS, 1.0F, 1.0F);
+        this.event("OK placed " + BuiltInRegistries.BLOCK.getKey(block) + " @ " + pos.toShortString());
+    }
+
+
+    // ==================================================
+    //                     Mining
+    // ==================================================
+    private Predicate<BlockState> blockFilter(String what) {
+        return switch (what) {
+            case "wood", "log", "logs" -> state -> state.is(BlockTags.LOGS);
+            case "stone" -> state -> state.is(BlockTags.BASE_STONE_OVERWORLD);
+            case "ore", "ores" -> state -> state.is(net.neoforged.neoforge.common.Tags.Blocks.ORES);
+            case "dirt" -> state -> state.is(BlockTags.DIRT);
+            case "sand" -> state -> state.is(BlockTags.SAND);
+            default -> {
+                if (what.startsWith("#")) {
+                    TagKey<Block> tag = TagKey.create(Registries.BLOCK, ResourceLocation.parse(what.substring(1)));
+                    yield state -> state.is(tag);
+                }
+                Block block = BuiltInRegistries.BLOCK.getOptional(ResourceLocation.parse(what)).orElseThrow(() -> new IllegalArgumentException("unknown block " + what));
+                yield state -> state.is(block);
+            }
+        };
+    }
+
+    /**
+     * Advances mining of breakPos by one tick: walks into reach, then digs at the real speed for the held tool (via the
+     * fake player), with the crack overlay. Returns true when the block is broken (drops go to the inventory).
+     */
+    private boolean tickBreak(PuppetEntity puppet) {
+        ServerLevel level = (ServerLevel) puppet.level();
+        BlockState state = level.getBlockState(this.breakPos);
+        if (state.isAir()) {
+            return true;
+        }
+        if (state.getDestroySpeed(level, this.breakPos) < 0) {
+            this.event("FAIL break: " + BuiltInRegistries.BLOCK.getKey(state.getBlock()) + " is unbreakable");
+            this.gatherBlacklist.add(this.breakPos);
+            this.breakPos = null;
+            return false;
+        }
+        Vec3 center = Vec3.atCenterOf(this.breakPos);
+        if (puppet.getEyePosition().distanceTo(center) > REACH) {
+            if (++this.breakApproachTicks > 200) {
+                this.event("STUCK break: can't reach " + this.breakPos.toShortString());
+                this.gatherBlacklist.add(this.breakPos);
+                level.destroyBlockProgress(puppet.getId(), this.breakPos, -1);
+                this.breakPos = null;
+                return false;
+            }
+            if (this.breakApproachTicks % 20 == 1 || puppet.getNavigation().isDone()) {
+                puppet.getNavigation().moveTo(center.x, center.y, center.z, 1.2D);
+            }
+            return false;
+        }
+        puppet.getNavigation().stop();
+        this.lookAt(puppet, center);
+        FakePlayer fake = this.fakePlayer(puppet);
+        this.breakProgress += state.getDestroyProgress(fake, level, this.breakPos);
+        if (this.ticks % 5 == 0) {
+            puppet.swing(InteractionHand.MAIN_HAND);
+        }
+        level.destroyBlockProgress(puppet.getId(), this.breakPos, Math.min(9, (int) (this.breakProgress * 10)));
+        if (this.breakProgress < 1.0F) {
+            fake.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+            return false;
+        }
+
+        // Broken: drops into the inventory, like a player walking over them.
+        ItemStack tool = fake.getMainHandItem();
+        BlockEntity blockEntity = level.getBlockEntity(this.breakPos);
+        boolean canHarvest = !state.requiresCorrectToolForDrops() || tool.isCorrectToolForDrops(state);
+        if (canHarvest) {
+            for (ItemStack drop : Block.getDrops(state, level, this.breakPos, blockEntity, puppet, tool)) {
+                this.stashOrDrop(puppet, drop);
+            }
+        }
+        tool.mineBlock(level, state, this.breakPos, fake);
+        level.destroyBlockProgress(puppet.getId(), this.breakPos, -1);
+        level.destroyBlock(this.breakPos, false, puppet);
+        this.syncBack(puppet, fake);
+        this.breakProgress = 0;
+        this.breakApproachTicks = 0;
+        return true;
+    }
+
+    /** Nearest matching block within 24 blocks of the puppet that touches air (so it can be reached), skipping the blacklist. **/
+    private BlockPos findGatherTarget(PuppetEntity puppet) {
+        ServerLevel level = (ServerLevel) puppet.level();
+        BlockPos origin = puppet.blockPosition();
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        int radius = 24;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int x = -radius; x <= radius; x++) {
+            for (int y = -8; y <= 16; y++) {
+                for (int z = -radius; z <= radius; z++) {
+                    pos.set(origin.getX() + x, origin.getY() + y, origin.getZ() + z);
+                    double distance = x * x + y * y * 2 + z * z;
+                    if (distance >= bestDistance || !level.isLoaded(pos) || this.gatherBlacklist.contains(pos)) {
+                        continue;
+                    }
+                    if (!this.gatherFilter.test(level.getBlockState(pos))) {
+                        continue;
+                    }
+                    boolean exposed = false;
+                    for (Direction direction : Direction.values()) {
+                        if (level.getBlockState(pos.relative(direction)).isAir()) {
+                            exposed = true;
+                            break;
+                        }
+                    }
+                    if (exposed) {
+                        best = pos.immutable();
+                        bestDistance = distance;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+
+    // ==================================================
+    //                  Puppet Orders
+    // ==================================================
+    private void tickPuppet() {
+        PuppetEntity puppet = this.getPuppet();
+        if (puppet == null || this.mode == Mode.IDLE) {
+            return;
+        }
+        if (this.attackCooldown > 0) {
+            this.attackCooldown--;
+        }
+
+        switch (this.mode) {
+            case WALK -> {
+                double distance = puppet.position().distanceTo(this.walkTarget);
+                if (distance < 1.5D) {
+                    this.mode = Mode.IDLE;
+                    this.event("DONE walkto, puppet at " + fmt(puppet.position()));
+                } else if (puppet.getNavigation().isDone()) {
+                    if (++this.stuckTicks > 40) {
+                        this.mode = Mode.IDLE;
+                        this.event("STUCK walkto: no path, puppet at " + fmt(puppet.position()) + ", " + Math.round(distance) + " blocks from target");
+                    } else if (this.stuckTicks % 10 == 0) {
+                        puppet.getNavigation().moveTo(this.walkTarget.x, this.walkTarget.y, this.walkTarget.z, this.walkSpeed);
+                    }
+                }
+            }
+            case FOLLOW -> {
+                Entity target = this.targetName == null ? this.getOwner() : this.findEntity(puppet, this.targetName, 96);
+                this.followTick(puppet, target);
+            }
+            case GUARD -> {
+                Entity guarded = this.targetName == null ? this.getOwner() : this.findEntity(puppet, this.targetName, 96);
+                Entity threat = this.attackTarget != null ? ((ServerLevel) puppet.level()).getEntity(this.attackTarget) : null;
+                if (threat == null || !threat.isAlive()) {
+                    this.attackTarget = null;
+                    if (guarded != null && this.ticks % 10 == 0) {
+                        List<Entity> threats = guarded.level().getEntities(guarded, guarded.getBoundingBox().inflate(12),
+                                entity -> entity instanceof Enemy && entity instanceof LivingEntity && entity.isAlive() && !(entity instanceof PuppetEntity));
+                        threats.stream().min(Comparator.comparingDouble(entity -> entity.distanceTo(guarded))).ifPresent(found -> {
+                            this.attackTarget = found.getUUID();
+                            this.event("GUARD engaging " + describe(found, puppet));
+                        });
+                    }
+                    if (this.attackTarget == null) {
+                        this.followTick(puppet, guarded);
+                    }
+                } else {
+                    this.fightTick(puppet, (LivingEntity) threat);
+                }
+            }
+            case ATTACK -> {
+                Entity target = this.attackTarget != null ? ((ServerLevel) puppet.level()).getEntity(this.attackTarget) : null;
+                if (!(target instanceof LivingEntity living) || !living.isAlive()) {
+                    this.setIdle();
+                    this.event("DONE attack: target " + (target == null ? "gone" : "dead"));
+                    return;
+                }
+                this.fightTick(puppet, living);
+            }
+            case BREAK -> {
+                if (this.breakPos == null) {
+                    this.mode = Mode.IDLE;
+                } else if (this.tickBreak(puppet)) {
+                    this.event("DONE break, holding " + itemId(puppet.getMainHandItem()));
+                    this.setIdle();
+                }
+            }
+            case GATHER -> {
+                if (this.breakPos == null) {
+                    if (this.gatherCount >= this.gatherWanted) {
+                        this.event("DONE gather " + this.gatherName + ": " + this.gatherCount + " blocks, inventory: " + this.inventorySummary(puppet));
+                        this.setIdle();
+                        return;
+                    }
+                    if (this.ticks % 10 != 0) {
+                        return;
+                    }
+                    this.breakPos = this.findGatherTarget(puppet);
+                    this.breakProgress = 0;
+                    this.breakApproachTicks = 0;
+                    if (this.breakPos == null) {
+                        this.event("DONE gather " + this.gatherName + ": ran out of reachable blocks within 24 after " + this.gatherCount + ", inventory: " + this.inventorySummary(puppet));
+                        this.setIdle();
+                    }
+                } else if (this.tickBreak(puppet)) {
+                    this.gatherCount++;
+                    this.breakPos = null;
+                }
+            }
+            default -> {
+            }
+        }
+    }
+
+    private void followTick(PuppetEntity puppet, Entity target) {
+        if (target == null || target.level() != puppet.level()) {
+            return;
+        }
+        double distance = puppet.distanceTo(target);
+        if (distance > 48) {
+            puppet.moveTo(target.getX(), target.getY(), target.getZ(), puppet.getYRot(), 0); // Too far behind: catch up.
+        } else if (distance > this.followDistance) {
+            if (this.ticks % 10 == 0 || puppet.getNavigation().isDone()) {
+                puppet.getNavigation().moveTo(target, distance > 8 ? 1.5D : 1.1D);
+            }
+        } else {
+            puppet.getNavigation().stop();
+            puppet.getLookControl().setLookAt(target);
+        }
+    }
+
+    /** Melee, or bow shots from range when holding a bow with arrows. **/
+    private void fightTick(PuppetEntity puppet, LivingEntity target) {
+        puppet.getLookControl().setLookAt(target);
+        double distance = puppet.distanceTo(target);
+        boolean archer = puppet.getMainHandItem().getItem() instanceof BowItem && puppet.getInventory().hasAnyOf(Set.of(Items.ARROW));
+        if (archer && distance < 20 && puppet.hasLineOfSight(target)) {
+            puppet.getNavigation().stop();
+            if (this.attackCooldown <= 0) {
+                this.shoot(puppet, target);
+                this.attackCooldown = 25;
+            }
+            return;
+        }
+        if (distance > 2.5D) {
+            if (this.ticks % 10 == 0 || puppet.getNavigation().isDone()) {
+                puppet.getNavigation().moveTo(target, 1.4D);
+            }
+        } else if (this.attackCooldown <= 0) {
+            puppet.swing(InteractionHand.MAIN_HAND);
+            puppet.doHurtTarget(target);
+            this.attackCooldown = 12;
+        }
+    }
+
+
+    // ==================================================
+    //                     Lookups
+    // ==================================================
+    private PuppetEntity getPuppet() {
+        if (this.puppetId == null || this.server == null) {
+            return null;
+        }
+        for (ServerLevel level : this.server.getAllLevels()) {
+            if (level.getEntity(this.puppetId) instanceof PuppetEntity puppet && puppet.isAlive()) {
+                return puppet;
+            }
+        }
+        return null;
+    }
+
+    private ServerPlayer getOwner() {
+        return this.ownerId == null || this.server == null ? null : this.server.getPlayerList().getPlayer(this.ownerId);
+    }
+
+    /** Nearest living entity (players first) whose name or type id matches the text. **/
+    private Entity findEntity(Entity from, String text, double range) {
+        String lower = text.toLowerCase();
+        for (ServerPlayer player : this.server.getPlayerList().getPlayers()) {
+            if (player.getName().getString().equalsIgnoreCase(text) && player.level() == from.level()) {
+                return player;
+            }
+        }
+        List<Entity> matches = from.level().getEntities(from, from.getBoundingBox().inflate(range), entity -> {
+            if (!(entity instanceof LivingEntity) || !entity.isAlive()) {
+                return false;
+            }
+            String name = entity.getName().getString().toLowerCase();
+            String type = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
+            return name.equals(lower) || name.contains(lower) || type.equals(lower) || type.endsWith(":" + lower);
+        });
+        return matches.stream().min(Comparator.comparingDouble(entity -> entity.distanceTo(from))).orElse(null);
+    }
+
+
+    // ==================================================
+    //                      State
+    // ==================================================
+    private String inventorySummary(PuppetEntity puppet) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (int i = 0; i < puppet.getInventory().getContainerSize(); i++) {
+            ItemStack stack = puppet.getInventory().getItem(i);
+            if (!stack.isEmpty()) {
+                counts.merge(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), stack.getCount(), Integer::sum);
+            }
+        }
+        if (counts.isEmpty()) {
+            return "empty";
+        }
+        StringBuilder builder = new StringBuilder();
+        counts.forEach((id, count) -> builder.append(builder.isEmpty() ? "" : ", ").append(id).append(" x").append(count));
+        return builder.toString();
+    }
+
+    private void writeState() {
+        JsonObject state = new JsonObject();
+        state.addProperty("time", LocalTime.now().format(TIME));
+        ServerPlayer owner = this.getOwner();
+        PuppetEntity puppet = this.getPuppet();
+        ServerLevel level = owner != null ? owner.serverLevel() : this.server.overworld();
+        state.addProperty("dayTime", level.getDayTime() % 24000);
+        state.addProperty("weather", level.isThundering() ? "thunder" : level.isRaining() ? "rain" : "clear");
+        state.addProperty("difficulty", level.getDifficulty().getKey());
+
+        JsonArray players = new JsonArray();
+        for (ServerPlayer player : this.server.getPlayerList().getPlayers()) {
+            JsonObject entry = new JsonObject();
+            entry.addProperty("name", player.getName().getString());
+            entry.addProperty("dimension", player.level().dimension().location().toString());
+            entry.addProperty("pos", fmt(player.position()));
+            entry.addProperty("facing", player.getDirection().getName() + " (yaw " + Math.round(player.getYRot()) + ", pitch " + Math.round(player.getXRot()) + ")");
+            entry.addProperty("health", player.getHealth());
+            entry.addProperty("food", player.getFoodData().getFoodLevel());
+            entry.addProperty("gamemode", player.gameMode.getGameModeForPlayer().getName());
+            entry.addProperty("held", itemId(player.getMainHandItem()));
+            HitResult hit = player.pick(20, 1, false);
+            if (hit instanceof BlockHitResult blockHit && hit.getType() == HitResult.Type.BLOCK) {
+                entry.addProperty("lookingAt", BuiltInRegistries.BLOCK.getKey(player.level().getBlockState(blockHit.getBlockPos()).getBlock()) + " @ " + blockHit.getBlockPos().toShortString());
+            }
+            entry.addProperty("biome", player.level().getBiome(player.blockPosition()).unwrapKey().map(key -> key.location().toString()).orElse("?"));
+            players.add(entry);
+        }
+        state.add("players", players);
+
+        if (puppet != null) {
+            JsonObject puppetState = new JsonObject();
+            puppetState.addProperty("pos", fmt(puppet.position()));
+            puppetState.addProperty("dimension", puppet.level().dimension().location().toString());
+            puppetState.addProperty("health", Math.round(puppet.getHealth()) + "/" + Math.round(puppet.getMaxHealth()));
+            String modeText = this.mode.name().toLowerCase();
+            switch (this.mode) {
+                case WALK -> modeText += " " + fmt(this.walkTarget);
+                case FOLLOW, GUARD -> modeText += " " + (this.targetName == null ? "owner" : this.targetName);
+                case GATHER -> modeText += " " + this.gatherName + " " + this.gatherCount + "/" + this.gatherWanted;
+                case BREAK -> modeText += this.breakPos != null ? " " + this.breakPos.toShortString() : "";
+                default -> {
+                }
+            }
+            puppetState.addProperty("mode", modeText);
+            puppetState.addProperty("held", itemId(puppet.getMainHandItem()));
+            puppetState.addProperty("offhand", itemId(puppet.getOffhandItem()));
+            puppetState.addProperty("armor", itemId(puppet.getItemBySlot(EquipmentSlot.HEAD)) + ", " + itemId(puppet.getItemBySlot(EquipmentSlot.CHEST)) + ", "
+                    + itemId(puppet.getItemBySlot(EquipmentSlot.LEGS)) + ", " + itemId(puppet.getItemBySlot(EquipmentSlot.FEET)));
+            puppetState.addProperty("inventory", this.inventorySummary(puppet));
+            puppetState.addProperty("invulnerable", puppet.isInvulnerable());
+            if (owner != null && owner.level() == puppet.level()) {
+                puppetState.addProperty("distanceToOwner", Math.round(puppet.distanceTo(owner) * 10) / 10.0);
+            }
+            state.add("puppet", puppetState);
+        } else if (this.respawnTimer > 0) {
+            state.addProperty("puppet", "dead, respawning in " + (this.respawnTimer / 20) + "s");
+        }
+
+        Entity center = owner != null ? owner : puppet;
+        if (center != null) {
+            JsonArray entities = new JsonArray();
+            List<Entity> nearby = center.level().getEntities(center, center.getBoundingBox().inflate(32), entity -> entity instanceof LivingEntity && !(entity instanceof ServerPlayer) && !(entity instanceof PuppetEntity));
+            nearby.sort(Comparator.comparingDouble(entity -> entity.distanceTo(center)));
+            for (Entity entity : nearby.subList(0, Math.min(25, nearby.size()))) {
+                entities.add(describe(entity, center));
+            }
+            state.add("nearbyEntities", entities);
+        }
+
+        try {
+            Path tmp = this.dir.resolve("state.json.tmp");
+            Files.writeString(tmp, GSON.toJson(state), StandardCharsets.UTF_8);
+            Files.move(tmp, this.dir.resolve("state.json"), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static JsonObject describe(Entity entity, Entity from) {
+        JsonObject entry = new JsonObject();
+        entry.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
+        if (entity.hasCustomName()) {
+            entry.addProperty("name", entity.getName().getString());
+        }
+        entry.addProperty("pos", fmt(entity.position()));
+        entry.addProperty("distance", Math.round(entity.distanceTo(from) * 10) / 10.0);
+        if (entity instanceof LivingEntity living) {
+            entry.addProperty("health", Math.round(living.getHealth() * 10) / 10.0 + "/" + Math.round(living.getMaxHealth()));
+        }
+        return entry;
+    }
+
+    private static String itemId(ItemStack stack) {
+        return stack.isEmpty() ? "empty" : BuiltInRegistries.ITEM.getKey(stack.getItem()) + (stack.getCount() > 1 ? " x" + stack.getCount() : "");
+    }
+
+    private static String fmt(Vec3 pos) {
+        return String.format("%.1f %.1f %.1f", pos.x, pos.y, pos.z);
+    }
+}
