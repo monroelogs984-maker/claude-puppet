@@ -177,7 +177,10 @@ public class PuppetBridge {
                 .then(Commands.literal("off").executes(context -> this.deactivate(context.getSource().getPlayer(), true)))
                 .then(Commands.literal("snapshot")
                         .executes(context -> this.snapshot(192, true))
-                        .then(Commands.argument("width", com.mojang.brigadier.arguments.IntegerArgumentType.integer(32, 512))
+                        .then(Commands.literal("low").executes(context -> this.snapshot(192, true)))
+                        .then(Commands.literal("high").executes(context -> this.snapshot(640, true)))
+                        .then(Commands.literal("full").executes(context -> this.snapshot(0, true)))
+                        .then(Commands.argument("width", com.mojang.brigadier.arguments.IntegerArgumentType.integer(32, 4096))
                                 .executes(context -> this.snapshot(com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "width"), true))))
                 .then(Commands.literal("effort")
                         .executes(context -> {
@@ -712,7 +715,8 @@ public class PuppetBridge {
                     puppet.setItemSlot(puppet.getEquipmentSlotForItem(stack), stack);
                 }
                 case "snapshot" -> {
-                    this.snapshot(args.length > 0 ? Integer.parseInt(args[0]) : 192, false);
+                    String size = args.length > 0 ? args[0] : "low";
+                    this.snapshot(switch (size) { case "low" -> 192; case "high" -> 640; case "full" -> 0; default -> Integer.parseInt(size); }, false);
                     return; // Result is logged as SNAPSHOT / FAIL.
                 }
                 case "jump" -> {

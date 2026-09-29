@@ -33,8 +33,8 @@ following the owner afterwards, fights back against mobs that hit it, and eats f
 
 ## Snapshots
 
-`/claudepuppet snapshot [width]` (or Claude's `snapshot` command) saves what the puppet sees to
-`claudepuppet/view.png`, default 192 pixels wide. The client renders one or two frames from the puppet's eyes (first
+`/claudepuppet snapshot [low|high|full|<width>]` (or Claude's `snapshot` command) saves what the puppet sees to
+`claudepuppet/view.png`: low = 192 wide (default), high = 640, full = your window's resolution. The client renders one or two frames from the puppet's eyes (first
 person, HUD hidden, so you may see a flicker), shrinks the image and switches back. Small images are cheap for Claude
 to look at. Singleplayer client only.
 

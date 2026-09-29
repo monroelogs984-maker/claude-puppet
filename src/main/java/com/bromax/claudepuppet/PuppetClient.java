@@ -56,7 +56,7 @@ public class PuppetClient {
             }
             snapshotEntityId = entityId;
             snapshotPath = path;
-            snapshotWidth = Math.max(32, Math.min(512, width));
+            snapshotWidth = width <= 0 ? 0 : Math.max(32, Math.min(4096, width)); // 0 = full window resolution
             snapshotDone = done;
             snapshotFrames = 0;
         });
@@ -92,12 +92,17 @@ public class PuppetClient {
         Minecraft mc = Minecraft.getInstance();
         String result;
         try (NativeImage full = Screenshot.takeScreenshot(mc.getMainRenderTarget())) {
-            int height = Math.max(1, Math.round(snapshotWidth * (float) full.getHeight() / full.getWidth()));
-            try (NativeImage small = new NativeImage(snapshotWidth, height, false)) {
-                full.resizeSubRectTo(0, 0, full.getWidth(), full.getHeight(), small);
-                small.writeToFile(snapshotPath);
+            if (snapshotWidth <= 0 || snapshotWidth >= full.getWidth()) {
+                full.writeToFile(snapshotPath);
+                result = "SNAPSHOT " + snapshotPath + " (" + full.getWidth() + "x" + full.getHeight() + ", full)";
+            } else {
+                int height = Math.max(1, Math.round(snapshotWidth * (float) full.getHeight() / full.getWidth()));
+                try (NativeImage small = new NativeImage(snapshotWidth, height, false)) {
+                    full.resizeSubRectTo(0, 0, full.getWidth(), full.getHeight(), small);
+                    small.writeToFile(snapshotPath);
+                }
+                result = "SNAPSHOT " + snapshotPath + " (" + snapshotWidth + "x" + height + ")";
             }
-            result = "SNAPSHOT " + snapshotPath + " (" + snapshotWidth + "x" + height + ")";
         } catch (Exception e) {
             result = "FAIL snapshot: " + e;
         }
