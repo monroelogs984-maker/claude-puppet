@@ -93,6 +93,10 @@ block breaks go through the normal player code paths and hooks. It follows the o
   blocks skipping the night, and isn't saved: it's removed when the world closes and re-summoned with the command.
 - If any mod errors while ticking it, the super puppet is removed and the error is logged instead of crashing the world.
 - Moves by steering (face the target, walk, sprint, jump), without mob pathfinding.
+- `/claudepuppet super possess [steps]` (or `super possess`/`super step <inputs>`/`super release`): the same
+  step-by-step possession as the regular puppet, driving the player body: forward/back/left/right, turn, look, jump,
+  sneak, sprint, wait, `hit` (real player attack, or mining at real tool speed), `use`, `release`, `place <block>`,
+  `select <item>`. Each step reports the crosshair and saves `super_view.png`.
 
 ## The puppet
 

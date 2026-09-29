@@ -54,6 +54,10 @@ public class SuperControl {
     private int respawnTimer = -1;
     private boolean wanted = false;
 
+    /** Claude driving the super puppet step by step (null when not possessed). **/
+    private SuperPossession possession;
+    private final List<String> stepNotes = new java.util.ArrayList<>();
+
     public SuperControl(PuppetBridge bridge, Consumer<String> event) {
         this.bridge = bridge;
         this.event = event;
@@ -116,6 +120,7 @@ public class SuperControl {
     }
 
     public void remove(MinecraftServer server, boolean dropItems) {
+        this.possession = null;
         SuperPuppet body = this.body;
         this.body = null;
         this.setIdle();
@@ -203,7 +208,9 @@ public class SuperControl {
         body.xxa = 0;
         body.setJumping(false);
         body.setSprinting(false);
-        if (!body.isSleeping()) {
+        if (this.possession != null) {
+            this.tickPossession(body);
+        } else if (!body.isSleeping()) {
             this.tickOrders(body, owner);
         }
         body.doTick(); // Physics, item use, food, effects... (a real connection would call this)
@@ -302,6 +309,97 @@ public class SuperControl {
         return false;
     }
 
+    // ==================================================
+    //                   Possession
+    // ==================================================
+    public String startPossession(int steps) {
+        SuperPuppet body = this.getBody();
+        if (body == null) {
+            return "FAIL super possess: no super puppet";
+        }
+        this.setIdle();
+        this.possession = new SuperPossession(steps, body);
+        this.stepNotes.clear();
+        body.server.getPlayerList().broadcastSystemMessage(net.minecraft.network.chat.Component.literal("[Puppet] Claude has taken control of the super puppet (" + steps + " steps).")
+                .withStyle(net.minecraft.ChatFormatting.GRAY, net.minecraft.ChatFormatting.ITALIC), false);
+        this.reportStep(body);
+        return "OK super possess " + steps;
+    }
+
+    public void releasePossession(String reason) {
+        if (this.possession == null) {
+            return;
+        }
+        this.possession = null;
+        SuperPuppet body = this.getBody();
+        if (body != null) {
+            body.setShiftKeyDown(false);
+            body.releaseUsingItem();
+            body.server.getPlayerList().broadcastSystemMessage(net.minecraft.network.chat.Component.literal("[Puppet] Claude released the super puppet.")
+                    .withStyle(net.minecraft.ChatFormatting.GRAY, net.minecraft.ChatFormatting.ITALIC), false);
+        }
+        this.event.accept("SUPER POSSESS ended: " + reason);
+        this.mode = Mode.FOLLOW;
+        this.followName = null;
+    }
+
+    public String queueStep(String inputs) {
+        if (this.possession == null) {
+            return "FAIL super step: not possessing the super puppet";
+        }
+        if (this.possession.stepRunning || this.possession.awaitingSnapshot) {
+            return "FAIL super step: previous step still running";
+        }
+        this.possession.queueStep(inputs);
+        return null;
+    }
+
+    private void tickPossession(SuperPuppet body) {
+        SuperPossession session = this.possession;
+        String result = session.tick(body);
+        if (result != null && !result.isEmpty()) {
+            this.stepNotes.add(result);
+        } else if ("".equals(result)) {
+            session.stepsUsed++;
+            this.reportStep(body);
+        }
+        if (this.possession == session && !session.stepRunning && !session.awaitingSnapshot && ++session.idleTicks > SuperPossession.IDLE_RELEASE_TICKS) {
+            this.releasePossession("no input from Claude for 60s");
+        }
+    }
+
+    private void reportStep(SuperPuppet body) {
+        SuperPossession session = this.possession;
+        session.awaitingSnapshot = true;
+        List<String> hostiles = new java.util.ArrayList<>();
+        for (Entity entity : body.level().getEntities(body, body.getBoundingBox().inflate(16), entity -> entity instanceof net.minecraft.world.entity.monster.Enemy && entity.isAlive())) {
+            hostiles.add(BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath() + " " + Math.round(entity.distanceTo(body)) + "m");
+        }
+        String line = "SUPER STEP " + session.stepsUsed + "/" + session.totalSteps
+                + " | crosshair: " + session.describeCrosshair(body)
+                + " | @" + fmt(body.position()) + " yaw " + Math.round(session.yaw) + " pitch " + Math.round(session.pitch)
+                + " | hp " + Math.round(body.getHealth()) + " food " + body.getFoodData().getFoodLevel() + (body.onGround() ? "" : " airborne") + (body.isInWater() ? " in water" : "")
+                + " | hand " + itemId(body.getMainHandItem()) + (body.isUsingItem() ? " (using)" : "")
+                + " | hostiles: " + (hostiles.isEmpty() ? "none within 16" : String.join(", ", hostiles))
+                + (this.stepNotes.isEmpty() ? "" : " | notes: " + String.join("; ", this.stepNotes));
+        this.stepNotes.clear();
+        boolean last = session.stepsUsed >= session.totalSteps;
+        MinecraftServer server = body.server;
+        java.nio.file.Path view = this.bridge.bridgeDir() != null ? this.bridge.bridgeDir().resolve("super_view.png") : null;
+        if (view == null) {
+            session.awaitingSnapshot = false;
+            this.event.accept(line + " | view: none");
+            return;
+        }
+        PuppetBridge.SNAPSHOT.request(body.getId(), view, 256, result -> {
+            this.event.accept(line + " | view: " + (result.startsWith("SNAPSHOT") ? "super_view.png" : result));
+            session.awaitingSnapshot = false;
+            if (last && this.possession == session) {
+                server.execute(() -> this.releasePossession("out of steps"));
+            }
+        });
+    }
+
     private void setIdle() {
         this.mode = Mode.IDLE;
         this.attackTarget = null;
@@ -352,6 +450,21 @@ public class SuperControl {
                     this.mode = Mode.ATTACK;
                 }
                 case "stop" -> this.setIdle();
+                case "possess" -> {
+                    return this.startPossession(args.length > 1 ? Math.max(1, Math.min(30, Integer.parseInt(args[1]))) : 10);
+                }
+                case "release" -> {
+                    if (this.possession != null) {
+                        this.releasePossession("released by Claude");
+                    } else {
+                        body.releaseUsingItem();
+                    }
+                }
+                case "step" -> {
+                    String inputs = String.join(" ", java.util.Arrays.copyOfRange(args, 1, args.length));
+                    String problem = this.queueStep(inputs);
+                    return problem != null ? problem : "OK super step queued";
+                }
                 case "tp" -> {
                     Vec3 target = targetFrom.apply(args, 1);
                     body.teleportTo(target.x, target.y, target.z);
@@ -373,9 +486,6 @@ public class SuperControl {
                 case "use" -> {
                     var result = body.gameMode.useItem(body, body.serverLevel(), body.getMainHandItem(), InteractionHand.MAIN_HAND);
                     return "SUPER USE " + itemId(body.getMainHandItem()) + " -> " + result + (body.isUsingItem() ? " (holding use; 'super release' to let go)" : "");
-                }
-                case "release" -> {
-                    body.releaseUsingItem();
                 }
                 case "useon" -> {
                     BlockPos pos = BlockPos.containing(Double.parseDouble(args[1]), Double.parseDouble(args[2]), Double.parseDouble(args[3]));
@@ -501,7 +611,8 @@ public class SuperControl {
         if (body == null) {
             return this.respawnTimer > 0 ? "super: dead, respawning" : null;
         }
-        return "super " + Math.round(body.getHealth()) + "hp food " + body.getFoodData().getFoodLevel() + " " + this.mode.name().toLowerCase(Locale.ROOT)
+        return "super " + Math.round(body.getHealth()) + "hp food " + body.getFoodData().getFoodLevel() + " "
+                + (this.possession != null ? "possessed " + this.possession.stepsUsed + "/" + this.possession.totalSteps : this.mode.name().toLowerCase(Locale.ROOT))
                 + " @" + String.format(Locale.ROOT, "%.0f %.0f %.0f", body.getX(), body.getY(), body.getZ()) + " hand:" + itemId(body.getMainHandItem())
                 + (body.isSleeping() ? " sleeping" : "");
     }

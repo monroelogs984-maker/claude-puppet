@@ -248,7 +248,12 @@ public class PuppetBridge {
                 .then(Commands.literal("super")
                         .executes(context -> this.superCommand(context.getSource(), true))
                         .then(Commands.literal("on").executes(context -> this.superCommand(context.getSource(), true)))
-                        .then(Commands.literal("off").executes(context -> this.superCommand(context.getSource(), false))))
+                        .then(Commands.literal("off").executes(context -> this.superCommand(context.getSource(), false)))
+                        .then(Commands.literal("possess")
+                                .executes(context -> { this.event(this.superControl.startPossession(10)); return Command.SINGLE_SUCCESS; })
+                                .then(Commands.argument("steps", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 30))
+                                        .executes(context -> { this.event(this.superControl.startPossession(com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "steps"))); return Command.SINGLE_SUCCESS; })))
+                        .then(Commands.literal("release").executes(context -> { this.superControl.releasePossession("released by " + context.getSource().getTextName()); return Command.SINGLE_SUCCESS; })))
                 .then(Commands.literal("possess")
                         .executes(context -> this.startPossession(10))
                         .then(Commands.argument("steps", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 30))
@@ -561,6 +566,10 @@ public class PuppetBridge {
 
     public void possessPlace(PuppetEntity puppet, BlockPos pos, String blockId) {
         this.place(puppet, pos, blockId);
+    }
+
+    public Path bridgeDir() {
+        return this.dir;
     }
 
     private int superCommand(CommandSourceStack source, boolean on) {
