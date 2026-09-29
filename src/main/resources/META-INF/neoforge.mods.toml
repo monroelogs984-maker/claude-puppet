@@ -14,7 +14,7 @@ Singleplayer bridge for Claude: '/claudepuppet' lets Claude read chat, run comma
 [[dependencies.${mod_id}]]
     modId="neoforge"
     type="required"
-    versionRange="[${neo_version},)"
+    versionRange="[21.1.0,)"
     ordering="NONE"
     side="BOTH"
 
