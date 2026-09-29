@@ -122,6 +122,12 @@ public class PuppetBridge {
     private static final GameProfile FAKE_PROFILE = new GameProfile(UUID.fromString("c1a0de00-7075-4e74-8000-000000c1a0de"), "Claude");
     private static final double REACH = 4.5D;
 
+    /** Takes a puppet's-eye snapshot on the (singleplayer) client; set by PuppetClient. No-op on a dedicated server. **/
+    public interface SnapshotRequester {
+        void request(int entityId, Path path, int width, java.util.function.Consumer<String> done);
+    }
+    public static SnapshotRequester SNAPSHOT = (entityId, path, width, done) -> done.accept("FAIL snapshot: needs a singleplayer client");
+
     private MinecraftServer server;
     private boolean active = false;
     private Path dir;
@@ -169,6 +175,10 @@ public class PuppetBridge {
                 .requires(source -> source.isPlayer() && (source.getServer().isSingleplayerOwner(source.getPlayer().getGameProfile()) || source.hasPermission(2)))
                 .executes(context -> this.activate(context.getSource().getPlayer()))
                 .then(Commands.literal("off").executes(context -> this.deactivate(context.getSource().getPlayer(), true)))
+                .then(Commands.literal("snapshot")
+                        .executes(context -> this.snapshot(192, true))
+                        .then(Commands.argument("width", com.mojang.brigadier.arguments.IntegerArgumentType.integer(32, 512))
+                                .executes(context -> this.snapshot(com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "width"), true))))
                 .then(Commands.literal("effort")
                         .executes(context -> {
                             context.getSource().sendSystemMessage(Component.literal("Claude's effort: " + this.effort + " (off, low, normal, high)").withStyle(ChatFormatting.GRAY));
@@ -203,6 +213,17 @@ public class PuppetBridge {
         this.writeEffort();
         source.sendSystemMessage(Component.literal("Claude's effort: " + level + ". " + EFFORT_INFO.get(level)).withStyle(ChatFormatting.GRAY));
         this.event("EFFORT " + level);
+        return Command.SINGLE_SUCCESS;
+    }
+
+    /** Saves a small image of what the puppet sees to claudepuppet/view.png (logged as SNAPSHOT, which wakes Claude). **/
+    private int snapshot(int width, boolean requestedByPlayer) {
+        PuppetEntity puppet = this.getPuppet();
+        if (!this.active || puppet == null) {
+            this.event("FAIL snapshot: no puppet");
+            return 0;
+        }
+        SNAPSHOT.request(puppet.getId(), this.dir.resolve("view.png"), width, result -> this.event(result + (requestedByPlayer ? " (requested by the player)" : "")));
         return Command.SINGLE_SUCCESS;
     }
 
@@ -689,6 +710,10 @@ public class PuppetBridge {
                     this.requirePuppet(puppet);
                     ItemStack stack = this.itemStack(args[0]);
                     puppet.setItemSlot(puppet.getEquipmentSlotForItem(stack), stack);
+                }
+                case "snapshot" -> {
+                    this.snapshot(args.length > 0 ? Integer.parseInt(args[0]) : 192, false);
+                    return; // Result is logged as SNAPSHOT / FAIL.
                 }
                 case "jump" -> {
                     this.requirePuppet(puppet);

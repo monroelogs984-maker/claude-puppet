@@ -31,6 +31,13 @@ The puppet handles routine work itself: it announces finished jobs in chat (`[Pu
 following the owner afterwards, fights back against mobs that hit it, and eats from its backpack below half health.
 `status.txt` is a one-line summary for cheap reads.
 
+## Snapshots
+
+`/claudepuppet snapshot [width]` (or Claude's `snapshot` command) saves what the puppet sees to
+`claudepuppet/view.png`, default 192 pixels wide. The client renders one or two frames from the puppet's eyes (first
+person, HUD hidden, so you may see a flicker), shrinks the image and switches back. Small images are cheap for Claude
+to look at. Singleplayer client only.
+
 ## The puppet
 
 A pathfinding mob with the player model and a robot skin (`make_skin.py` generates it). 150 health, regenerates out

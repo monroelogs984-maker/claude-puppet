@@ -43,6 +43,7 @@ public class ClaudePuppet {
 
         if (FMLEnvironment.dist.isClient()) {
             modEventBus.addListener(PuppetClient::registerRenderers);
+            PuppetClient.init();
         }
     }
 }
