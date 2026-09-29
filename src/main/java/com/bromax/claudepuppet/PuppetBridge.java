@@ -171,6 +171,9 @@ public class PuppetBridge {
     /** How much Claude listens: off, low (default), normal or high. Read by Claude's watcher from effort.txt. **/
     private String effort = "low";
     private static final List<String> EFFORT_LEVELS = List.of("off", "low", "normal", "high");
+    /** Undo history for Claude's block changes, and the world's named marks. **/
+    private final PuppetWorldTools tools = new PuppetWorldTools();
+
     /** The running /claudemonitor recap, if any. **/
     private PuppetMonitor monitor;
     /** Chat from the last minute (game time, line), kept so a monitor report can include what was said just before. **/
@@ -185,6 +188,36 @@ public class PuppetBridge {
     // ==================================================
     public void onRegisterCommands(RegisterCommandsEvent event) {
         java.util.function.Predicate<CommandSourceStack> allowed = source -> source.isPlayer() && (source.getServer().isSingleplayerOwner(source.getPlayer().getGameProfile()) || source.hasPermission(2));
+        event.getDispatcher().register(Commands.literal("claudeundo")
+                .requires(allowed)
+                .executes(context -> this.undo(context.getSource(), 1))
+                .then(Commands.argument("count", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 20))
+                        .executes(context -> this.undo(context.getSource(), com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "count")))));
+        event.getDispatcher().register(Commands.literal("claudemark")
+                .requires(allowed)
+                .then(Commands.literal("list").executes(context -> this.listMarks(context.getSource())))
+                .then(Commands.literal("remove").then(Commands.argument("name", com.mojang.brigadier.arguments.StringArgumentType.word())
+                        .suggests((context, builder) -> net.minecraft.commands.SharedSuggestionProvider.suggest(this.tools.getMarks().keySet(), builder))
+                        .executes(context -> {
+                            this.tools.loadMarks(context.getSource().getServer());
+                            String name = com.mojang.brigadier.arguments.StringArgumentType.getString(context, "name");
+                            boolean removed = this.tools.removeMark(name);
+                            context.getSource().sendSystemMessage(Component.literal(removed ? "Removed mark '" + name + "'." : "No mark called '" + name + "'.").withStyle(ChatFormatting.GRAY));
+                            if (removed) {
+                                this.event("MARK removed " + name);
+                            }
+                            return removed ? Command.SINGLE_SUCCESS : 0;
+                        })))
+                .then(Commands.argument("name", com.mojang.brigadier.arguments.StringArgumentType.word())
+                        .executes(context -> {
+                            ServerPlayer player = context.getSource().getPlayer();
+                            this.tools.loadMarks(player.getServer());
+                            String name = com.mojang.brigadier.arguments.StringArgumentType.getString(context, "name");
+                            this.tools.setMark(name, player.level().dimension(), player.position());
+                            context.getSource().sendSystemMessage(Component.literal("Marked '" + name.toLowerCase() + "' at " + this.tools.getMark(name).describe() + ".").withStyle(ChatFormatting.GRAY));
+                            this.event("MARK " + name.toLowerCase() + " = " + this.tools.getMark(name).describe());
+                            return Command.SINGLE_SUCCESS;
+                        })));
         event.getDispatcher().register(Commands.literal("claudemonitor")
                 .requires(allowed)
                 .executes(context -> this.startMonitor(context.getSource().getPlayer(), 30, false))
@@ -333,6 +366,48 @@ public class PuppetBridge {
         this.event("MONITOR " + path + (viewNote != null ? " + monitor_view.png" : ""));
     }
 
+    private int undo(CommandSourceStack source, int count) {
+        MinecraftServer server = source.getServer();
+        int done = 0;
+        for (int i = 0; i < count; i++) {
+            String result = this.tools.undo(server);
+            if (result == null) {
+                break;
+            }
+            done++;
+            source.sendSystemMessage(Component.literal("[Claude] " + result).withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC));
+            this.event("UNDO " + result);
+        }
+        if (done == 0) {
+            source.sendSystemMessage(Component.literal("Nothing of Claude's to undo.").withStyle(ChatFormatting.GRAY));
+        }
+        return done;
+    }
+
+    private int listMarks(CommandSourceStack source) {
+        this.tools.loadMarks(source.getServer());
+        if (this.tools.getMarks().isEmpty()) {
+            source.sendSystemMessage(Component.literal("No marks yet. /claudemark <name> saves where you stand.").withStyle(ChatFormatting.GRAY));
+            return 0;
+        }
+        source.sendSystemMessage(Component.literal("Marks:").withStyle(ChatFormatting.GRAY));
+        this.tools.getMarks().forEach((name, mark) -> source.sendSystemMessage(Component.literal("  " + name + ": " + mark.describe()).withStyle(ChatFormatting.GRAY)));
+        return this.tools.getMarks().size();
+    }
+
+    /** A coordinate triple from args, or a mark name (in the puppet's dimension). **/
+    private Vec3 targetFrom(String[] args, int index) {
+        if (args.length > index && !args[index].matches("-?[0-9.~]+")) {
+            this.tools.loadMarks(this.server);
+            PuppetWorldTools.Mark mark = this.tools.getMark(args[index]);
+            if (mark == null) {
+                throw new IllegalArgumentException("no mark called '" + args[index] + "'");
+            }
+            return mark.pos();
+        }
+        return new Vec3(Double.parseDouble(args[index]), Double.parseDouble(args[index + 1]), Double.parseDouble(args[index + 2]));
+    }
+
     private void writeEffort() {
         if (this.dir == null) {
             return;
@@ -375,6 +450,7 @@ public class PuppetBridge {
             player.sendSystemMessage(Component.literal("Claude Puppet couldn't create " + this.dir + ": " + e).withStyle(ChatFormatting.RED));
             return false;
         }
+        this.tools.loadMarks(this.server);
         this.active = true;
         return true;
     }
@@ -688,8 +764,9 @@ public class PuppetBridge {
                 case "walkto" -> {
                     this.requirePuppet(puppet);
                     this.setIdle();
-                    this.walkTarget = new Vec3(Double.parseDouble(args[0]), Double.parseDouble(args[1]), Double.parseDouble(args[2]));
-                    this.walkSpeed = args.length > 3 ? Double.parseDouble(args[3]) : 1.0D;
+                    boolean byMark = !args[0].matches("-?[0-9.~]+");
+                    this.walkTarget = this.targetFrom(args, 0);
+                    this.walkSpeed = args.length > (byMark ? 1 : 3) ? Double.parseDouble(args[byMark ? 1 : 3]) : 1.0D;
                     this.mode = Mode.WALK;
                     puppet.getNavigation().moveTo(this.walkTarget.x, this.walkTarget.y, this.walkTarget.z, this.walkSpeed);
                 }
@@ -738,7 +815,8 @@ public class PuppetBridge {
                 }
                 case "tp" -> {
                     this.requirePuppet(puppet);
-                    puppet.moveTo(Double.parseDouble(args[0]), Double.parseDouble(args[1]), Double.parseDouble(args[2]), puppet.getYRot(), 0);
+                    Vec3 target = this.targetFrom(args, 0);
+                    puppet.moveTo(target.x, target.y, target.z, puppet.getYRot(), 0);
                     puppet.getNavigation().stop();
                 }
                 case "here" -> {
@@ -873,6 +951,36 @@ public class PuppetBridge {
                     ItemStack stack = this.itemStack(args[0]);
                     puppet.setItemSlot(puppet.getEquipmentSlotForItem(stack), stack);
                 }
+                case "undo" -> {
+                    int count = args.length > 0 ? Integer.parseInt(args[0]) : 1;
+                    for (int i = 0; i < count; i++) {
+                        String result = this.tools.undo(this.server);
+                        if (result == null) {
+                            this.event("FAIL undo: nothing left to undo");
+                            break;
+                        }
+                        this.event("UNDO " + result);
+                    }
+                    return;
+                }
+                case "mark" -> {
+                    this.tools.loadMarks(this.server);
+                    Vec3 at = args.length >= 4 ? new Vec3(Double.parseDouble(args[1]), Double.parseDouble(args[2]), Double.parseDouble(args[3]))
+                            : puppet != null ? puppet.position() : owner != null ? owner.position() : null;
+                    Entity where = puppet != null ? puppet : owner;
+                    if (at == null || where == null) {
+                        this.event("FAIL mark: no position");
+                        return;
+                    }
+                    this.tools.setMark(args[0], where.level().dimension(), at);
+                    this.event("MARK " + args[0].toLowerCase() + " = " + this.tools.getMark(args[0]).describe());
+                    return;
+                }
+                case "unmark" -> {
+                    this.tools.loadMarks(this.server);
+                    this.event(this.tools.removeMark(args[0]) ? "MARK removed " + args[0] : "FAIL unmark: no mark " + args[0]);
+                    return;
+                }
                 case "watch" -> {
                     this.watch(args.length > 0 ? Integer.parseInt(args[0]) : 20, false);
                     return;
@@ -990,6 +1098,15 @@ public class PuppetBridge {
         };
         CommandSourceStack source = new CommandSourceStack(output, pos, Vec2.ZERO, level, 4, "Claude", Component.literal("Claude"), this.server, puppet);
         this.event("CMD /" + command);
+        String first = command.trim().split("\\s+")[0].toLowerCase();
+        if (first.equals("fill") || first.equals("setblock") || first.equals("clone")) {
+            String problem = this.tools.recordCommand(level, pos, command);
+            if (problem != null) {
+                this.event("NOTE not undoable: " + problem);
+            }
+        } else if (first.equals("execute") && command.contains(" run ") && command.matches(".*\\brun (fill|setblock|clone)\\b.*")) {
+            this.event("NOTE not undoable: block commands inside /execute aren't recorded");
+        }
         this.server.getCommands().performPrefixedCommand(source, command);
     }
 
@@ -1101,6 +1218,7 @@ public class PuppetBridge {
         }
         this.lookAt(puppet, Vec3.atCenterOf(pos));
         puppet.swing(InteractionHand.MAIN_HAND);
+        this.tools.recordBlock(level, "puppet placed " + BuiltInRegistries.BLOCK.getKey(block).getPath(), pos);
         level.setBlockAndUpdate(pos, block.defaultBlockState());
         level.playSound(null, pos, block.defaultBlockState().getSoundType().getPlaceSound(), SoundSource.BLOCKS, 1.0F, 1.0F);
         this.event("OK placed " + BuiltInRegistries.BLOCK.getKey(block) + " @ " + pos.toShortString());
@@ -1182,6 +1300,7 @@ public class PuppetBridge {
         }
         tool.mineBlock(level, state, this.breakPos, fake);
         level.destroyBlockProgress(puppet.getId(), this.breakPos, -1);
+        this.tools.recordBlock(level, "puppet broke " + BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath(), this.breakPos);
         level.destroyBlock(this.breakPos, false, puppet);
         this.syncBack(puppet, fake);
         this.breakProgress = 0;
@@ -1549,6 +1668,11 @@ public class PuppetBridge {
             status.append(" | near:");
             nearbyCounts.forEach((type, count) -> status.append(" ").append(type).append(count > 1 ? "x" + count : ""));
         }
+        if (!this.tools.getMarks().isEmpty()) {
+            status.append(" | marks:");
+            this.tools.getMarks().forEach((name, mark) -> status.append(" ").append(name).append("=").append(String.format("%.0f,%.0f,%.0f", mark.x(), mark.y(), mark.z())));
+        }
+        status.append(" | undo:").append(this.tools.undoSize());
         status.append(" | t").append(level.getDayTime() % 24000).append(" ").append(level.isThundering() ? "thunder" : level.isRaining() ? "rain" : "clear");
         try {
             Files.writeString(this.dir.resolve("status.txt"), status + "\n", StandardCharsets.UTF_8);

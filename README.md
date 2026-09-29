@@ -55,6 +55,16 @@ blocks broken and placed). `view` adds `monitor_view.png`: frames from your own 
 only the HUD blinks). It works without the puppet, and it's a single wake-up for Claude, so the cost is about one reply
 (text) or one `watch` (view).
 
+## Undo and marks
+
+- `/claudeundo [count]` reverts Claude's last block changes: every `fill`, `setblock` or `clone` Claude runs, and every
+  block the puppet breaks or places, records the blocks it's about to change first (including chest contents and other
+  block data). The last 20 changes are kept for this play session. Block commands wrapped in `/execute` or using
+  `^local` coordinates can't be recorded; Claude gets told when that happens. Claude has an `undo` command too.
+- `/claudemark <name>` saves where you stand, `/claudemark list` shows all, `/claudemark remove <name>` deletes one.
+  Marks are saved with the world (`claudepuppet_marks.json` in the world folder). The puppet takes them anywhere it takes
+  coordinates (`walkto home`, `tp arena`), Claude can set them (`mark <name> [x y z]`), and they're in `status.txt`.
+
 ## The puppet
 
 A pathfinding mob with the player model and a robot skin (`make_skin.py` generates it). 150 health, regenerates out
