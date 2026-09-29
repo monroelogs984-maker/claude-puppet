@@ -38,6 +38,13 @@ following the owner afterwards, fights back against mobs that hit it, and eats f
 person, HUD hidden, so you may see a flicker), shrinks the image and switches back. Small images are cheap for Claude
 to look at. Singleplayer client only.
 
+## Watching (flipbook)
+
+`/claudepuppet watch [seconds]` (default 20, max 60, or Claude's `watch` command) captures one 256-wide frame of the
+puppet's view every 1.5 seconds and stitches them into a single grid image, `claudepuppet/watch.png` (5 frames per
+row, left to right then top to bottom). Claude gets the whole sequence in one look: about 13 frames for 20 seconds.
+Each frame is a one or two frame camera switch on your client, so expect a light flicker while it runs.
+
 ## The puppet
 
 A pathfinding mob with the player model and a robot skin (`make_skin.py` generates it). 150 health, regenerates out

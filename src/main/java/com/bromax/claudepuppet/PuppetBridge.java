@@ -128,6 +128,14 @@ public class PuppetBridge {
     }
     public static SnapshotRequester SNAPSHOT = (entityId, path, width, done) -> done.accept("FAIL snapshot: needs a singleplayer client");
 
+    /** Takes a flipbook (several frames over time, stitched into one grid image); set by PuppetClient. **/
+    public interface FlipbookRequester {
+        void request(int entityId, Path path, int frames, int width, long intervalMs, java.util.function.Consumer<String> done);
+    }
+    public static FlipbookRequester FLIPBOOK = (entityId, path, frames, width, intervalMs, done) -> done.accept("FAIL watch: needs a singleplayer client");
+    private static final long WATCH_INTERVAL_MS = 1500L;
+    private static final int WATCH_FRAME_WIDTH = 256;
+
     private MinecraftServer server;
     private boolean active = false;
     private Path dir;
@@ -182,6 +190,10 @@ public class PuppetBridge {
                         .then(Commands.literal("full").executes(context -> this.snapshot(0, true)))
                         .then(Commands.argument("width", com.mojang.brigadier.arguments.IntegerArgumentType.integer(32, 4096))
                                 .executes(context -> this.snapshot(com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "width"), true))))
+                .then(Commands.literal("watch")
+                        .executes(context -> this.watch(20, true))
+                        .then(Commands.argument("seconds", com.mojang.brigadier.arguments.IntegerArgumentType.integer(2, 60))
+                                .executes(context -> this.watch(com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "seconds"), true))))
                 .then(Commands.literal("effort")
                         .executes(context -> {
                             context.getSource().sendSystemMessage(Component.literal("Claude's effort: " + this.effort + " (off, low, normal, high)").withStyle(ChatFormatting.GRAY));
@@ -227,6 +239,22 @@ public class PuppetBridge {
             return 0;
         }
         SNAPSHOT.request(puppet.getId(), this.dir.resolve("view.png"), width, result -> this.event(result + (requestedByPlayer ? " (requested by the player)" : "")));
+        return Command.SINGLE_SUCCESS;
+    }
+
+    /**
+     * A flipbook: one 256-wide frame of the puppet's view every 1.5 seconds for the given time, delivered as one grid
+     * image (claudepuppet/watch.png), so Claude sees the sequence for the cost of a single look.
+     */
+    private int watch(int seconds, boolean requestedByPlayer) {
+        PuppetEntity puppet = this.getPuppet();
+        if (!this.active || puppet == null) {
+            this.event("FAIL watch: no puppet");
+            return 0;
+        }
+        int frames = (int) Math.max(1, Math.round(seconds * 1000.0 / WATCH_INTERVAL_MS));
+        FLIPBOOK.request(puppet.getId(), this.dir.resolve("watch.png"), frames, WATCH_FRAME_WIDTH, WATCH_INTERVAL_MS, result -> this.event(result + (requestedByPlayer ? " (requested by the player)" : "")));
+        this.announce("Watching for " + seconds + "s...");
         return Command.SINGLE_SUCCESS;
     }
 
@@ -713,6 +741,10 @@ public class PuppetBridge {
                     this.requirePuppet(puppet);
                     ItemStack stack = this.itemStack(args[0]);
                     puppet.setItemSlot(puppet.getEquipmentSlotForItem(stack), stack);
+                }
+                case "watch" -> {
+                    this.watch(args.length > 0 ? Integer.parseInt(args[0]) : 20, false);
+                    return;
                 }
                 case "snapshot" -> {
                     String size = args.length > 0 ? args[0] : "low";

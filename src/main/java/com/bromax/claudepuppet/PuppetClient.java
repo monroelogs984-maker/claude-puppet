@@ -37,8 +37,20 @@ public class PuppetClient {
     private static CameraType previousCameraType;
     private static boolean previousHideGui;
 
+    // Flipbook in progress: one frame every intervalMs, stitched into a grid when done.
+    private static int sequenceEntityId = -1;
+    private static Path sequencePath;
+    private static int sequenceTotal;
+    private static int sequenceWidth;
+    private static long sequenceIntervalMs;
+    private static long sequenceNextAt;
+    private static Consumer<String> sequenceDone;
+    private static final java.util.List<NativeImage> sequenceFrames = new java.util.ArrayList<>();
+    private static boolean captureForSequence = false;
+
     public static void init() {
         PuppetBridge.SNAPSHOT = PuppetClient::requestSnapshot;
+        PuppetBridge.FLIPBOOK = PuppetClient::requestFlipbook;
         NeoForge.EVENT_BUS.addListener(PuppetClient::onRenderFramePre);
         NeoForge.EVENT_BUS.addListener(PuppetClient::onRenderFramePost);
     }
@@ -62,7 +74,38 @@ public class PuppetClient {
         });
     }
 
+    /** Called from the integrated server thread: frames every intervalMs, stitched into one grid image at path. **/
+    public static void requestFlipbook(int entityId, Path path, int frames, int width, long intervalMs, Consumer<String> done) {
+        Minecraft.getInstance().execute(() -> {
+            if (sequenceEntityId >= 0) {
+                done.accept("FAIL watch: already watching");
+                return;
+            }
+            sequenceEntityId = entityId;
+            sequencePath = path;
+            sequenceTotal = Math.max(1, Math.min(40, frames));
+            sequenceWidth = Math.max(32, Math.min(512, width));
+            sequenceIntervalMs = intervalMs;
+            sequenceNextAt = 0;
+            sequenceDone = done;
+            sequenceFrames.forEach(NativeImage::close);
+            sequenceFrames.clear();
+        });
+    }
+
     private static void onRenderFramePre(RenderFrameEvent.Pre event) {
+        // Start the next flipbook frame when it's due and no single snapshot is running.
+        if (sequenceEntityId >= 0 && snapshotEntityId < 0 && System.currentTimeMillis() >= sequenceNextAt) {
+            snapshotEntityId = sequenceEntityId;
+            snapshotWidth = sequenceWidth;
+            snapshotFrames = 0;
+            captureForSequence = true;
+            snapshotDone = result -> {
+                if (result.startsWith("FAIL")) {
+                    finishSequence(result);
+                }
+            };
+        }
         if (snapshotEntityId < 0 || snapshotFrames > 0) {
             return;
         }
@@ -91,6 +134,26 @@ public class PuppetClient {
         }
         Minecraft mc = Minecraft.getInstance();
         String result;
+        if (captureForSequence) {
+            captureForSequence = false;
+            try (NativeImage full = Screenshot.takeScreenshot(mc.getMainRenderTarget())) {
+                int height = Math.max(1, Math.round(snapshotWidth * (float) full.getHeight() / full.getWidth()));
+                NativeImage small = new NativeImage(snapshotWidth, height, false);
+                full.resizeSubRectTo(0, 0, full.getWidth(), full.getHeight(), small);
+                sequenceFrames.add(small);
+            } catch (Exception e) {
+                restoreCamera(mc);
+                finish("FAIL watch: " + e);
+                return;
+            }
+            restoreCamera(mc);
+            finish("frame");
+            sequenceNextAt = System.currentTimeMillis() + sequenceIntervalMs;
+            if (sequenceFrames.size() >= sequenceTotal) {
+                finishSequence(null);
+            }
+            return;
+        }
         try (NativeImage full = Screenshot.takeScreenshot(mc.getMainRenderTarget())) {
             if (snapshotWidth <= 0 || snapshotWidth >= full.getWidth()) {
                 full.writeToFile(snapshotPath);
@@ -108,6 +171,41 @@ public class PuppetClient {
         }
         restoreCamera(mc);
         finish(result);
+    }
+
+    /** Stitches the flipbook frames into a grid (5 per row, left to right, top to bottom) with 2px gaps. **/
+    private static void finishSequence(String failure) {
+        Consumer<String> done = sequenceDone;
+        String result = failure;
+        if (result == null && !sequenceFrames.isEmpty()) {
+            int frameW = sequenceFrames.get(0).getWidth();
+            int frameH = sequenceFrames.get(0).getHeight();
+            int cols = Math.min(5, sequenceFrames.size());
+            int rows = (sequenceFrames.size() + cols - 1) / cols;
+            int gap = 2;
+            try (NativeImage grid = new NativeImage(cols * frameW + (cols - 1) * gap, rows * frameH + (rows - 1) * gap, true)) {
+                for (int i = 0; i < sequenceFrames.size(); i++) {
+                    NativeImage frame = sequenceFrames.get(i);
+                    int ox = (i % cols) * (frameW + gap);
+                    int oy = (i / cols) * (frameH + gap);
+                    for (int y = 0; y < frameH; y++) {
+                        for (int x = 0; x < frameW; x++) {
+                            grid.setPixelRGBA(ox + x, oy + y, frame.getPixelRGBA(x, y));
+                        }
+                    }
+                }
+                grid.writeToFile(sequencePath);
+                result = "SNAPSHOT " + sequencePath + " (flipbook: " + sequenceFrames.size() + " frames of " + frameW + "x" + frameH + ", " + (sequenceIntervalMs / 1000.0) + "s apart, left to right then top to bottom)";
+            } catch (Exception e) {
+                result = "FAIL watch: " + e;
+            }
+        }
+        sequenceFrames.forEach(NativeImage::close);
+        sequenceFrames.clear();
+        sequenceEntityId = -1;
+        if (done != null) {
+            done.accept(result);
+        }
     }
 
     private static void restoreCamera(Minecraft mc) {
